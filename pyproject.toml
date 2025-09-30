@@ -13,6 +13,11 @@ dependencies = [
   "llm>=0.27.1",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3",
+]
+
 [project.entry-points."llm"]
 mr = "llm_mr.plugin:register"
 
