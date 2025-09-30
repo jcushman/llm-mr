@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-mr"
+version = "0.1.0"
+description = "Map-reduce spreadsheet operations powered by LLM prompts"
+readme = "README.md"
+authors = [{ name = "SheetMap Contributors" }]
+requires-python = ">=3.9"
+dependencies = [
+  "llm>=0.27.1",
+]
+
+[project.entry-points."llm"]
+mr = "llm_mr.plugin:register"
+
+[project.urls]
+Homepage = "https://github.com/your-org/llm-mr"
+Issues = "https://github.com/your-org/llm-mr/issues"
+
+[tool.uv]
+package = true
+
+[tool.uv.dev-dependencies]
+format = [
+  "ruff>=0.7.0",
+]
+test = [
+  "pytest>=8.3",
+]
