@@ -1,19 +1,15 @@
 import csv
 import json
-import sys
 from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
 
 import llm
 import pytest
 from click.testing import CliRunner
 from llm.cli import cli
 from llm.plugins import pm
+from openpyxl import Workbook, load_workbook
 
-from llm_mr.plugin import register as register_commands
+from llm_mr.plugin import register_commands
 
 
 class MockModel(llm.Model):
@@ -23,13 +19,22 @@ class MockModel(llm.Model):
         self.responses = []
         self.last_prompt = None
         self.prompt_history = []
+        self.last_schema = None
+        self.schema_history = []
 
     def queue_response(self, text: str) -> None:
         self.responses.append(text)
 
+    @property
+    def supports_schema(self):
+        return True
+
     def execute(self, prompt, stream, response, conversation):
         self.last_prompt = prompt
         self.prompt_history.append(prompt.prompt)
+        if hasattr(prompt, "options") and "schema" in prompt.options:
+            self.last_schema = prompt.options["schema"]
+            self.schema_history.append(self.last_schema)
         text = self.responses.pop(0) if self.responses else ""
         return [text]
 
@@ -75,7 +80,51 @@ def _read_csv(path: Path):
         return list(reader)
 
 
-def test_map_command_filters_and_updates_rows(tmp_path, mock_model):
+def _write_jsonl(path: Path, rows):
+    with path.open("w", encoding="utf-8") as fp:
+        for row in rows:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _read_jsonl(path: Path):
+    rows = []
+    with path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _write_xlsx(path: Path, rows):
+    wb = Workbook()
+    ws = wb.active
+    if rows:
+        ws.append(list(rows[0].keys()))
+        for row in rows:
+            ws.append(list(row.values()))
+    wb.save(path)
+
+
+def _read_xlsx(path: Path):
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    header = [str(v) for v in next(rows_iter)]
+    result = []
+    for values in rows_iter:
+        result.append({header[i]: values[i] for i in range(len(header))})
+    wb.close()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Map tests
+# ---------------------------------------------------------------------------
+
+
+def test_map_prompt_mode(tmp_path, mock_model):
+    """Map with -p treats instruction as a literal LLM prompt."""
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
     rows = [
@@ -85,7 +134,7 @@ def test_map_command_filters_and_updates_rows(tmp_path, mock_model):
     ]
     _write_csv(input_path, rows)
 
-    mock_model.queue_response(json.dumps("Processed beta"))
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Processed beta"}}))
 
     runner = CliRunner()
     result = runner.invoke(
@@ -93,9 +142,10 @@ def test_map_command_filters_and_updates_rows(tmp_path, mock_model):
         [
             "mr",
             "map",
-            str(input_path),
-            "-p",
             "Return uppercase note",
+            "-p",
+            "-i",
+            str(input_path),
             "--where",
             "status=active",
             "--few-shot",
@@ -106,7 +156,7 @@ def test_map_command_filters_and_updates_rows(tmp_path, mock_model):
             "demo",
         ],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert f"Wrote 3 rows to {output_path}" in result.output
 
     written_rows = _read_csv(output_path)
@@ -114,21 +164,493 @@ def test_map_command_filters_and_updates_rows(tmp_path, mock_model):
     assert written_rows[1]["mr_result"] == "Processed beta"
     assert written_rows[2]["mr_result"] == ""
 
-    expected_lines = [
-        "You are assisting with spreadsheet transformations.",
-        "Return valid JSON with no additional commentary.",
-        "Here are example inputs and desired outputs:",
-        "{\"input\": {\"id\": \"1\", \"status\": \"active\", \"note\": \"alpha\"}, \"output\": \"existing\"}",
-        "User instruction:",
-        "Return uppercase note",
-        "Rows to process (JSON objects):",
-        "{\"id\": \"2\", \"status\": \"active\", \"note\": \"beta\", \"mr_result\": \"\"}",
-        "Return a JSON string or number representing the value for column 'mr_result'.",
+    prompt = mock_model.prompt_history[-1]
+    assert "You are assisting with spreadsheet transformations." in prompt
+    assert "<row_0>" in prompt
+    assert "For each row, provide a single value for column 'mr_result'" in prompt
+
+
+def test_map_expression_mode(tmp_path):
+    """Map with -e treats instruction as a Python expression."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
     ]
-    assert mock_model.prompt_history[-1].splitlines() == expected_lines
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            'row["name"].upper()',
+            "-e",
+            "-i",
+            str(input_path),
+            "-c",
+            "name_upper",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert f"Wrote 2 rows to {output_path}" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert written_rows[0]["name_upper"] == "ALICE"
+    assert written_rows[1]["name_upper"] == "BOB"
 
 
-def test_reduce_command_groups_rows(tmp_path, mock_model):
+def test_map_expression_mode_with_builtins(tmp_path):
+    """Expression mode has access to safe builtins."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "value": "42"},
+        {"id": "2", "value": "7"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            'str(int(row["value"]) * 2)',
+            "-e",
+            "-i",
+            str(input_path),
+            "-c",
+            "doubled",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert written_rows[0]["doubled"] == "84"
+    assert written_rows[1]["doubled"] == "14"
+
+
+def test_map_cannot_use_both_p_and_e(tmp_path):
+    """Using both -p and -e is an error."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"id": "1"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "some instruction",
+            "-p",
+            "-e",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Cannot use both -p and -e" in result.output
+
+
+def test_map_with_multiple_flag(tmp_path, mock_model):
+    """--multiple flag emits multiple output rows per input row."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "text": "apple and banana"},
+        {"id": "2", "text": "cherry"},
+    ]
+    _write_csv(input_path, rows)
+
+    mock_model.queue_response(json.dumps({"row_0": {"fruit": ["apple", "banana"]}}))
+    mock_model.queue_response(json.dumps({"row_0": {"fruit": ["cherry"]}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Extract individual fruit names from the text",
+            "-p",
+            "-i",
+            str(input_path),
+            "--column",
+            "fruit",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--multiple",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 3
+    assert written_rows[0] == {"id": "1", "text": "apple and banana", "fruit": "apple"}
+    assert written_rows[1] == {"id": "1", "text": "apple and banana", "fruit": "banana"}
+    assert written_rows[2] == {"id": "2", "text": "cherry", "fruit": "cherry"}
+
+    assert len(mock_model.prompt_history) == 2
+    for prompt in mock_model.prompt_history:
+        assert "For each row, provide zero or more values for column 'fruit'" in prompt
+
+
+def test_map_with_multiple_flag_empty_list(tmp_path, mock_model):
+    """--multiple with empty lists (zero results)."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "text": "nothing here"},
+        {"id": "2", "text": "apple"},
+    ]
+    _write_csv(input_path, rows)
+
+    mock_model.queue_response(json.dumps({"row_0": {"fruit": []}}))
+    mock_model.queue_response(json.dumps({"row_0": {"fruit": ["apple"]}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Extract fruit names",
+            "-p",
+            "-i",
+            str(input_path),
+            "--column",
+            "fruit",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--multiple",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 1
+    assert written_rows[0] == {"id": "2", "text": "apple", "fruit": "apple"}
+
+
+def test_map_rejects_model_without_schema_support(tmp_path):
+    """Map with -p fails with a clear error when model doesn't support schemas."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"id": "1", "note": "test"}])
+
+    class NoSchemaModel(llm.Model):
+        model_id = "no-schema"
+
+        def execute(self, prompt, stream, response, conversation):
+            return ["result"]
+
+    no_schema_model = NoSchemaModel()
+
+    class TestPlugin:
+        __name__ = "TestNoSchemaPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(no_schema_model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-no-schema")
+
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "no-schema",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "does not support schemas" in result.output
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_map_writes_err_file_on_failure(tmp_path):
+    """Failed map batches produce an .err sidecar with row indices."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    _write_csv(input_path, rows)
+
+    model = FailingMockModel(fail_on_calls={1})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
+    class TestPlugin:
+        __name__ = "TestMapFailPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-map-fail")
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "failing-demo",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "1 batches failed" in result.output
+
+        written_rows = _read_csv(output_path)
+        assert len(written_rows) == 2
+        assert written_rows[0]["mr_result"] == "Result 1"
+        assert written_rows[1]["mr_result"] == ""
+
+        errors = _read_err(err_path)
+        assert len(errors) == 1
+        assert errors[0]["row_indices"] == [1]
+        assert "Simulated API failure" in errors[0]["error"]
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_map_repair_retries_failed_rows(tmp_path, mock_model):
+    """--repair reads the .err file, retries failed rows, updates the output."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    _write_csv(input_path, rows)
+    _write_csv(
+        output_path,
+        [
+            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
+            {"id": "2", "note": "beta", "mr_result": ""},
+        ],
+    )
+    with err_path.open("w") as fp:
+        fp.write(json.dumps({"row_indices": [1], "error": "previous failure"}) + "\n")
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--repair",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Repairing 1 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == "Result 2"
+
+    assert not err_path.exists()
+
+
+def test_map_worker_model(tmp_path, mock_model):
+    """--worker-model is used for per-item LLM work."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"id": "1", "note": "test"}])
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "done"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--worker-model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written = _read_csv(output_path)
+    assert written[0]["mr_result"] == "done"
+
+
+def test_map_expression_with_limit(tmp_path):
+    """Map --limit processes only the first N rows."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
+        {"id": "3", "name": "carol"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            'row["name"].upper()',
+            "-e",
+            "-i",
+            str(input_path),
+            "-c",
+            "name_upper",
+            "--limit",
+            "2",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Wrote 2 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["name_upper"] == "ALICE"
+    assert written_rows[1]["name_upper"] == "BOB"
+
+
+def test_map_interactive_deterministic(tmp_path, mock_model):
+    """Interactive mode (default) synthesizes and applies a deterministic expression."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
+    ]
+    _write_csv(input_path, rows)
+
+    mock_model.queue_response(
+        json.dumps(
+            {
+                "expression": 'row["name"].upper()',
+                "deterministic": True,
+            }
+        )
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "uppercase the names",
+            "-i",
+            str(input_path),
+            "-c",
+            "name_upper",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+        input="y\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Using deterministic expression" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert written_rows[0]["name_upper"] == "ALICE"
+    assert written_rows[1]["name_upper"] == "BOB"
+
+
+def test_map_in_place(tmp_path):
+    """--in-place writes results back to the input file."""
+    input_path = tmp_path / "input.csv"
+    rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            'row["name"].upper()',
+            "-e",
+            "-i",
+            str(input_path),
+            "-c",
+            "name_upper",
+            "--in-place",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(input_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["name"] == "alice"
+    assert written_rows[0]["name_upper"] == "ALICE"
+
+
+# ---------------------------------------------------------------------------
+# Reduce tests
+# ---------------------------------------------------------------------------
+
+
+def test_reduce_prompt_mode(tmp_path, mock_model):
+    """Reduce with -p treats instruction as a literal LLM prompt."""
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
     rows = [
@@ -138,8 +660,8 @@ def test_reduce_command_groups_rows(tmp_path, mock_model):
     ]
     _write_csv(input_path, rows)
 
-    mock_model.queue_response(json.dumps("Summary A"))
-    mock_model.queue_response(json.dumps("Summary B"))
+    mock_model.queue_response(json.dumps({"mr_result": "Summary A"}))
+    mock_model.queue_response(json.dumps({"mr_result": "Summary B"}))
 
     runner = CliRunner()
     result = runner.invoke(
@@ -147,9 +669,10 @@ def test_reduce_command_groups_rows(tmp_path, mock_model):
         [
             "mr",
             "reduce",
-            str(input_path),
-            "-p",
             "Summarize group",
+            "-p",
+            "-i",
+            str(input_path),
             "--group-by",
             "team",
             "--output",
@@ -158,7 +681,7 @@ def test_reduce_command_groups_rows(tmp_path, mock_model):
             "demo",
         ],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert f"Wrote 2 group results to {output_path}" in result.output
 
     written_rows = _read_csv(output_path)
@@ -169,7 +692,1131 @@ def test_reduce_command_groups_rows(tmp_path, mock_model):
 
     assert len(mock_model.prompt_history) == 2
     for prompt in mock_model.prompt_history:
-        lines = prompt.splitlines()
-        assert lines[0] == "You are reducing a group of spreadsheet rows."
-        assert "Rows (JSON list):" in lines
-        assert "Reduction instruction:" in lines
+        assert "You are summarizing a group of spreadsheet rows." in prompt
+
+
+def test_reduce_expression_mode(tmp_path):
+    """Reduce with -e uses a deterministic Python expression over rows."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"team": "A", "score": "10"},
+        {"team": "A", "score": "12"},
+        {"team": "B", "score": "5"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            'sum(int(r["score"]) for r in rows)',
+            "-e",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Reduced 2 groups deterministically" in result.output
+
+    written_rows = _read_csv(output_path)
+    by_group = {r["group"]: r["mr_result"] for r in written_rows}
+    assert by_group["A"] == "22"
+    assert by_group["B"] == "5"
+
+
+def test_reduce_validates_group_by_columns(tmp_path, mock_model):
+    """Reduce fails when group-by column doesn't exist."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"team": "A", "score": "10"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "does-not-exist",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 1
+    assert (
+        "Column 'does-not-exist' specified in --group-by does not exist"
+        in result.output
+    )
+    assert "Available columns: team, score" in result.output
+
+
+def test_reduce_rejects_model_without_schema_support(tmp_path):
+    """Reduce with -p fails when model doesn't support schemas."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"team": "A", "score": "10"}])
+
+    class NoSchemaModel(llm.Model):
+        model_id = "no-schema-reduce"
+
+        def execute(self, prompt, stream, response, conversation):
+            return ["result"]
+
+    no_schema_model = NoSchemaModel()
+
+    class TestPlugin:
+        __name__ = "TestNoSchemaPluginReduce"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(no_schema_model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-no-schema-reduce")
+
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "reduce",
+                "Summarize",
+                "-p",
+                "-i",
+                str(input_path),
+                "--group-by",
+                "team",
+                "--output",
+                str(output_path),
+                "--model",
+                "no-schema-reduce",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "does not support schemas" in result.output
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_reduce_writes_err_file_on_failure(tmp_path):
+    """Failed reduce groups produce an .err sidecar."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [
+        {"team": "A", "score": "10"},
+        {"team": "A", "score": "12"},
+        {"team": "B", "score": "5"},
+    ]
+    _write_csv(input_path, rows)
+
+    model = FailingMockModel(fail_on_calls={1})
+    model.queue_response(json.dumps({"mr_result": "Summary A"}))
+
+    class TestPlugin:
+        __name__ = "TestFailPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-fail")
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "reduce",
+                "Summarize group",
+                "-p",
+                "-i",
+                str(input_path),
+                "--group-by",
+                "team",
+                "--output",
+                str(output_path),
+                "--model",
+                "failing-demo",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "1/2 groups failed" in result.output
+
+        written_rows = _read_csv(output_path)
+        assert len(written_rows) == 1
+        assert written_rows[0]["group"] == "A"
+        assert written_rows[0]["mr_result"] == "Summary A"
+
+        errors = _read_err(err_path)
+        assert len(errors) == 1
+        assert errors[0]["group_key"] == "B"
+        assert "Simulated API failure" in errors[0]["error"]
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_reduce_repair_retries_failed_groups(tmp_path, mock_model):
+    """--repair reads the .err file, retries failed groups, merges into output."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [
+        {"team": "A", "score": "10"},
+        {"team": "A", "score": "12"},
+        {"team": "B", "score": "5"},
+    ]
+    _write_csv(input_path, rows)
+
+    _write_csv(
+        output_path,
+        [
+            {"group": "A", "mr_result": "Summary A"},
+        ],
+    )
+    with err_path.open("w") as fp:
+        fp.write(json.dumps({"group_key": "B", "error": "previous failure"}) + "\n")
+
+    mock_model.queue_response(json.dumps({"mr_result": "Summary B"}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize group",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--repair",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Repairing 1 groups" in result.output
+
+    written_rows = _read_csv(output_path)
+    by_group = {r["group"]: r["mr_result"] for r in written_rows}
+    assert by_group["A"] == "Summary A"
+    assert by_group["B"] == "Summary B"
+
+    assert not err_path.exists()
+
+
+def test_reduce_repair_no_errors(tmp_path, mock_model):
+    """--repair with no .err file is a no-op."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"team": "A", "score": "10"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--repair",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "No errors to repair" in result.output
+    assert len(mock_model.prompt_history) == 0
+
+
+# ---------------------------------------------------------------------------
+# Filter tests
+# ---------------------------------------------------------------------------
+
+
+def test_filter_expression_mode(tmp_path):
+    """Filter with -e uses a deterministic Python predicate."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "score": "15", "name": "alice"},
+        {"id": "2", "score": "5", "name": "bob"},
+        {"id": "3", "score": "20", "name": "carol"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            'int(row["score"]) >= 10',
+            "-e",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Kept 2/3 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["name"] == "alice"
+    assert written_rows[1]["name"] == "carol"
+
+
+def test_filter_expression_string_match(tmp_path):
+    """Filter with -e can do string matching."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "topic": "prediction markets in 2024"},
+        {"id": "2", "topic": "weather forecast"},
+        {"id": "3", "topic": "polymarket prediction market"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            '"prediction market" in row["topic"].lower()',
+            "-e",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Kept 2/3 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["id"] == "1"
+    assert written_rows[1]["id"] == "3"
+
+
+def test_filter_prompt_mode(tmp_path, mock_model):
+    """Filter with -p uses LLM to classify each row."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "topic": "machine learning"},
+        {"id": "2", "topic": "gardening"},
+        {"id": "3", "topic": "neural networks"},
+    ]
+    _write_csv(input_path, rows)
+
+    mock_model.queue_response(json.dumps({"row_0": {"verdict": "keep"}}))
+    mock_model.queue_response(json.dumps({"row_0": {"verdict": "discard"}}))
+    mock_model.queue_response(json.dumps({"row_0": {"verdict": "keep"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            "about artificial intelligence",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Kept 2/3 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["topic"] == "machine learning"
+    assert written_rows[1]["topic"] == "neural networks"
+
+    for prompt in mock_model.prompt_history:
+        assert "filter_criterion" in prompt
+
+
+def test_filter_with_where_prefilter(tmp_path):
+    """Filter --where applies before the instruction filter."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "status": "active", "score": "15"},
+        {"id": "2", "status": "inactive", "score": "20"},
+        {"id": "3", "status": "active", "score": "5"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            'int(row["score"]) >= 10',
+            "-e",
+            "-i",
+            str(input_path),
+            "--where",
+            "status=active",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Kept 1/2 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 1
+    assert written_rows[0]["id"] == "1"
+
+
+def test_filter_with_limit(tmp_path):
+    """Filter --limit restricts rows before filtering."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"id": "1", "score": "15"},
+        {"id": "2", "score": "5"},
+        {"id": "3", "score": "20"},
+    ]
+    _write_csv(input_path, rows)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            'int(row["score"]) >= 10',
+            "-e",
+            "-i",
+            str(input_path),
+            "--limit",
+            "2",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Kept 1/2 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 1
+    assert written_rows[0]["id"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# Dry-run & verbose tests
+# ---------------------------------------------------------------------------
+
+
+def test_map_dry_run(tmp_path, mock_model):
+    """--dry-run shows the sample prompt and schema without making LLM calls."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(input_path, [{"id": "1", "note": "hello"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Summarize the note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(tmp_path / "out.csv"),
+            "--model",
+            "demo",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "DRY RUN" in result.output
+    assert "sample prompt" in result.output
+    assert "spreadsheet_rows" in result.output
+    assert "schema" in result.output
+    assert "Would process" in result.output
+    assert len(mock_model.prompt_history) == 0
+
+
+def test_map_verbose(tmp_path, mock_model):
+    """--verbose prints each prompt as it is sent."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(input_path, [{"id": "1", "note": "hello"}])
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "done"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Summarize the note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(tmp_path / "out.csv"),
+            "--model",
+            "demo",
+            "--verbose",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "--- prompt ---" in result.output
+    assert "spreadsheet_rows" in result.output
+    assert "--- end prompt ---" in result.output
+    assert len(mock_model.prompt_history) == 1
+
+
+def test_map_log_tip(tmp_path, mock_model):
+    """Map prints an llm logs tip after LLM processing."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(input_path, [{"id": "1", "note": "hello"}])
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "done"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Summarize the note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(tmp_path / "out.csv"),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "llm logs" in result.output
+
+
+def test_reduce_dry_run(tmp_path, mock_model):
+    """--dry-run on reduce shows sample prompt without making LLM calls."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(
+        input_path,
+        [
+            {"team": "A", "score": "10"},
+            {"team": "A", "score": "12"},
+        ],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize group",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--output",
+            str(tmp_path / "out.csv"),
+            "--model",
+            "demo",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "DRY RUN" in result.output
+    assert "Would process 1 groups" in result.output
+    assert len(mock_model.prompt_history) == 0
+
+
+def test_filter_dry_run(tmp_path, mock_model):
+    """--dry-run on filter shows sample prompt without making LLM calls."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(
+        input_path,
+        [
+            {"id": "1", "topic": "machine learning"},
+            {"id": "2", "topic": "gardening"},
+        ],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            "about AI",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(tmp_path / "out.csv"),
+            "--model",
+            "demo",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "DRY RUN" in result.output
+    assert "filter_criterion" in result.output
+    assert len(mock_model.prompt_history) == 0
+
+
+# ---------------------------------------------------------------------------
+# Format tests (JSONL, XLSX)
+# ---------------------------------------------------------------------------
+
+
+def test_map_expression_jsonl(tmp_path):
+    """Map -e works with JSONL input and output."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "name": "alice"},
+            {"id": "2", "name": "bob"},
+        ],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            'row["name"].upper()',
+            "-e",
+            "-i",
+            str(input_path),
+            "-c",
+            "name_upper",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["name_upper"] == "ALICE"
+    assert written_rows[1]["name_upper"] == "BOB"
+
+
+def test_map_expression_xlsx(tmp_path):
+    """Map -e works with XLSX input and output."""
+    input_path = tmp_path / "input.xlsx"
+    output_path = tmp_path / "output.xlsx"
+    _write_xlsx(
+        input_path,
+        [
+            {"id": "1", "name": "alice"},
+            {"id": "2", "name": "bob"},
+        ],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            'row["name"].upper()',
+            "-e",
+            "-i",
+            str(input_path),
+            "-c",
+            "name_upper",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_xlsx(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["name_upper"] == "ALICE"
+    assert written_rows[1]["name_upper"] == "BOB"
+
+
+# ---------------------------------------------------------------------------
+# Piping tests
+# ---------------------------------------------------------------------------
+
+
+def test_filter_stdin_stdout_jsonl(tmp_path):
+    """Filter reads JSONL from stdin and writes to stdout when no -i/-o."""
+    rows = [
+        {"id": "1", "score": "15"},
+        {"id": "2", "score": "5"},
+        {"id": "3", "score": "20"},
+    ]
+    stdin_data = "\n".join(json.dumps(r) for r in rows) + "\n"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "filter", 'int(row["score"]) >= 10', "-e"],
+        input=stdin_data,
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "Kept 2/3 rows" in result.stderr
+
+    output_rows = [json.loads(line) for line in result.stdout.strip().splitlines()]
+    assert len(output_rows) == 2
+    assert output_rows[0]["id"] == "1"
+    assert output_rows[1]["id"] == "3"
+
+
+def test_map_stdin_stdout_jsonl(tmp_path):
+    """Map reads JSONL from stdin and writes to stdout when no -i/-o."""
+    rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
+    ]
+    stdin_data = "\n".join(json.dumps(r) for r in rows) + "\n"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "map", 'row["name"].upper()', "-e", "-c", "upper"],
+        input=stdin_data,
+    )
+    assert result.exit_code == 0, result.stderr
+
+    output_rows = [json.loads(line) for line in result.stdout.strip().splitlines()]
+    assert len(output_rows) == 2
+    assert output_rows[0]["upper"] == "ALICE"
+    assert output_rows[1]["upper"] == "BOB"
+
+
+def test_reduce_stdin_stdout_jsonl(tmp_path):
+    """Reduce reads JSONL from stdin and writes to stdout when no -i/-o."""
+    rows = [
+        {"team": "A", "score": "10"},
+        {"team": "A", "score": "12"},
+        {"team": "B", "score": "5"},
+    ]
+    stdin_data = "\n".join(json.dumps(r) for r in rows) + "\n"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            'sum(int(r["score"]) for r in rows)',
+            "-e",
+            "--group-by",
+            "team",
+        ],
+        input=stdin_data,
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "Reduced 2 groups deterministically" in result.stderr
+
+    output_rows = [json.loads(line) for line in result.stdout.strip().splitlines()]
+    by_group = {r["group"]: r["mr_result"] for r in output_rows}
+    assert by_group["A"] == 22
+    assert by_group["B"] == 5
+
+
+def test_pipe_csv_with_format_flag(tmp_path):
+    """Piping CSV via stdin/stdout using -f csv."""
+    rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
+    ]
+    import io, csv as _csv
+    buf = io.StringIO()
+    writer = _csv.DictWriter(buf, fieldnames=["id", "name"])
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    stdin_data = buf.getvalue()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "filter", 'row["name"] == "alice"', "-e", "-f", "csv"],
+        input=stdin_data,
+    )
+    assert result.exit_code == 0, result.stderr
+
+    reader = _csv.DictReader(io.StringIO(result.stdout))
+    output_rows = list(reader)
+    assert len(output_rows) == 1
+    assert output_rows[0]["name"] == "alice"
+
+
+def test_format_cascade_file_extension(tmp_path):
+    """Format cascade: -i CSV input → output matches CSV when piping to stdout."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(input_path, [{"id": "1", "name": "alice"}, {"id": "2", "name": "bob"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "filter", 'row["name"] == "alice"', "-e", "-i", str(input_path)],
+    )
+    assert result.exit_code == 0, result.stderr
+
+    import io, csv as _csv
+    reader = _csv.DictReader(io.StringIO(result.stdout))
+    output_rows = list(reader)
+    assert len(output_rows) == 1
+    assert output_rows[0]["name"] == "alice"
+
+
+def test_format_cascade_output_format_override(tmp_path):
+    """--output-format overrides the cascade."""
+    input_path = tmp_path / "input.csv"
+    _write_csv(input_path, [{"id": "1", "name": "alice"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "filter",
+            "True",
+            "-e",
+            "-i",
+            str(input_path),
+            "--output-format",
+            "jsonl",
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+
+    output_rows = [json.loads(line) for line in result.stdout.strip().splitlines()]
+    assert len(output_rows) == 1
+    assert output_rows[0]["name"] == "alice"
+
+
+def test_interactive_mode_blocked_with_stdin():
+    """Interactive mode errors when reading from stdin (no -i)."""
+    stdin_data = '{"id": "1"}\n'
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "filter", "some instruction"],
+        input=stdin_data,
+    )
+    assert result.exit_code != 0
+    assert "Cannot use interactive mode when reading from stdin" in result.output
+
+
+def test_repair_requires_output_to_merge(tmp_path):
+    """--repair with --err but no -o still needs -o to merge results."""
+    stdin_data = '{"id": "1"}\n'
+    err_path = tmp_path / "errors.jsonl"
+    with err_path.open("w") as fp:
+        fp.write(json.dumps({"row_indices": [0], "error": "fail"}) + "\n")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "map", "some instruction", "-p", "--repair", "--err", str(err_path)],
+        input=stdin_data,
+    )
+    assert result.exit_code != 0
+    assert "--repair requires --output to merge results" in result.output
+
+
+def test_map_err_flag_overrides_default_sidecar(tmp_path):
+    """--err overrides the default <output>.err location."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    custom_err = tmp_path / "custom_errors.jsonl"
+    default_err = tmp_path / "output.csv.err"
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    _write_csv(input_path, rows)
+
+    model = FailingMockModel(fail_on_calls={1})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
+    class TestPlugin:
+        __name__ = "TestErrFlagPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-err-flag")
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "failing-demo",
+                "--err",
+                str(custom_err),
+            ],
+        )
+        assert result.exit_code == 0
+        assert "1 batches failed" in result.output
+
+        assert not default_err.exists(), "Default .err should not be created"
+        errors = _read_err(custom_err)
+        assert len(errors) == 1
+        assert errors[0]["row_indices"] == [1]
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_map_err_flag_enables_file_logging_with_stdout(tmp_path):
+    """--err enables file-based error logging when output goes to stdout."""
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    stdin_data = "\n".join(json.dumps(r) for r in rows) + "\n"
+    custom_err = tmp_path / "errors.jsonl"
+
+    model = FailingMockModel(fail_on_calls={1})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
+    class TestPlugin:
+        __name__ = "TestErrStdoutPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-err-stdout")
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "--model",
+                "failing-demo",
+                "--err",
+                str(custom_err),
+            ],
+            input=stdin_data,
+        )
+        assert result.exit_code == 0
+
+        errors = _read_err(custom_err)
+        assert len(errors) == 1
+        assert errors[0]["row_indices"] == [1]
+        assert "row_indices" not in result.stderr
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_map_repair_with_err_flag(tmp_path, mock_model):
+    """--repair works with explicit --err path."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    custom_err = tmp_path / "custom_errors.jsonl"
+
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    _write_csv(input_path, rows)
+    _write_csv(
+        output_path,
+        [
+            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
+            {"id": "2", "note": "beta", "mr_result": ""},
+        ],
+    )
+    with custom_err.open("w") as fp:
+        fp.write(json.dumps({"row_indices": [1], "error": "previous failure"}) + "\n")
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--repair",
+            "--err",
+            str(custom_err),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Repairing 1 rows" in result.output
+
+    written_rows = _read_csv(output_path)
+    assert written_rows[1]["mr_result"] == "Result 2"
+    assert not custom_err.exists()
+
+
+def test_repair_requires_output_or_err():
+    """--repair without -o or --err is an error."""
+    stdin_data = '{"id": "1"}\n'
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "map", "some instruction", "-p", "--repair"],
+        input=stdin_data,
+    )
+    assert result.exit_code != 0
+    assert "--repair requires --output or --err" in result.output
+
+
+def test_err_records_to_stderr_when_stdout_output(tmp_path):
+    """When output is stdout, error records go to stderr instead of sidecar."""
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    stdin_data = "\n".join(json.dumps(r) for r in rows) + "\n"
+
+    model = FailingMockModel(fail_on_calls={1})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
+    class TestPlugin:
+        __name__ = "TestStderrErrPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-stderr-err")
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["mr", "map", "Process note", "-p", "--model", "failing-demo"],
+            input=stdin_data,
+        )
+        assert result.exit_code == 0
+        assert "Simulated API failure" in result.stderr
+        assert "row_indices" in result.stderr
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_in_place_requires_input_file():
+    """--in-place without -i is an error."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "map", "some instruction", "-e", "--in-place"],
+        input='{"id": "1"}\n',
+    )
+    assert result.exit_code != 0
+    assert "--in-place requires -i" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Shared test helpers
+# ---------------------------------------------------------------------------
+
+
+class FailingMockModel(llm.Model):
+    """Model that fails on specific calls by index."""
+
+    model_id = "failing-demo"
+
+    def __init__(self, fail_on_calls=None):
+        self.fail_on_calls = fail_on_calls or set()
+        self.responses = []
+        self.call_count = 0
+        self.last_prompt = None
+        self.prompt_history = []
+
+    def queue_response(self, text: str) -> None:
+        self.responses.append(text)
+
+    @property
+    def supports_schema(self):
+        return True
+
+    def execute(self, prompt, stream, response, conversation):
+        idx = self.call_count
+        self.call_count += 1
+        self.last_prompt = prompt
+        self.prompt_history.append(prompt.prompt)
+        if idx in self.fail_on_calls:
+            raise RuntimeError(f"Simulated API failure on call {idx}")
+        text = self.responses.pop(0) if self.responses else ""
+        return [text]
+
+
+def _read_err(path):
+    if not path.exists():
+        return []
+    records = []
+    with path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records

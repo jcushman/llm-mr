@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import IO, Iterable, Iterator, Sequence, Union
 
 from openpyxl import Workbook, load_workbook
 
@@ -16,25 +17,41 @@ class CSVInputPlugin:
     extensions = [".csv"]
 
     @contextmanager
-    def open(self, path: Path) -> Iterator[TableStream]:
-        with path.open("r", encoding="utf-8", newline="") as fp:
-            reader = csv.DictReader(fp)
-            fieldnames = list(reader.fieldnames or [])
-            yield TableStream(rows=reader, fieldnames=fieldnames)
+    def open(self, source: Union[Path, IO[str]]) -> Iterator[TableStream]:
+        if isinstance(source, Path):
+            with source.open("r", encoding="utf-8", newline="") as fp:
+                yield self._read(fp)
+        else:
+            yield self._read(source)
+
+    @staticmethod
+    def _read(fp: IO[str]) -> TableStream:
+        reader = csv.DictReader(fp)
+        fieldnames = list(reader.fieldnames or [])
+        return TableStream(rows=reader, fieldnames=fieldnames)
 
 
 class CSVOutputPlugin:
     name = "csv"
     extensions = [".csv"]
 
-    def write(self, path: Path, rows: Iterable[Row], fieldnames: Iterable[str]) -> None:
+    def write(
+        self, dest: Union[Path, IO[str]], rows: Iterable[Row], fieldnames: Iterable[str]
+    ) -> None:
         field_list = list(fieldnames)
-        with path.open("w", encoding="utf-8", newline="") as fp:
-            writer = csv.DictWriter(fp, fieldnames=field_list)
-            if field_list:
-                writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
+        if isinstance(dest, Path):
+            with dest.open("w", encoding="utf-8", newline="") as fp:
+                self._write_fp(fp, rows, field_list)
+        else:
+            self._write_fp(dest, rows, field_list)
+
+    @staticmethod
+    def _write_fp(fp: IO[str], rows: Iterable[Row], field_list: list) -> None:
+        writer = csv.DictWriter(fp, fieldnames=field_list)
+        if field_list:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 class JSONLInputPlugin:
@@ -42,40 +59,54 @@ class JSONLInputPlugin:
     extensions = [".jsonl"]
 
     @contextmanager
-    def open(self, path: Path) -> Iterator[TableStream]:
-        with path.open("r", encoding="utf-8") as fp:
-            def generator():
-                for line in fp:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    yield json.loads(line)
+    def open(self, source: Union[Path, IO[str]]) -> Iterator[TableStream]:
+        if isinstance(source, Path):
+            with source.open("r", encoding="utf-8") as fp:
+                yield self._read(fp)
+        else:
+            yield self._read(source)
 
-            iterator = generator()
-            try:
-                first = next(iterator)
-            except StopIteration:
-                yield TableStream(rows=iter(()), fieldnames=[])
-                return
+    @staticmethod
+    def _read(fp: IO[str]) -> TableStream:
+        def generator():
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                yield json.loads(line)
 
-            def chain():
-                yield first
-                for row in iterator:
-                    yield row
+        iterator = generator()
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return TableStream(rows=iter(()), fieldnames=[])
 
-            fieldnames = list(first.keys()) if isinstance(first, dict) else []
-            yield TableStream(rows=chain(), fieldnames=fieldnames)
+        def chain():
+            yield first
+            yield from iterator
+
+        fieldnames = list(first.keys()) if isinstance(first, dict) else []
+        return TableStream(rows=chain(), fieldnames=fieldnames)
 
 
 class JSONLOutputPlugin:
     name = "jsonl"
     extensions = [".jsonl"]
 
-    def write(self, path: Path, rows: Iterable[Row], fieldnames: Sequence[str]) -> None:
-        with path.open("w", encoding="utf-8") as fp:
-            for row in rows:
-                fp.write(json.dumps(row, ensure_ascii=False))
-                fp.write("\n")
+    def write(
+        self, dest: Union[Path, IO[str]], rows: Iterable[Row], fieldnames: Sequence[str]
+    ) -> None:
+        if isinstance(dest, Path):
+            with dest.open("w", encoding="utf-8") as fp:
+                self._write_fp(fp, rows)
+        else:
+            self._write_fp(dest, rows)
+
+    @staticmethod
+    def _write_fp(fp: IO[str], rows: Iterable[Row]) -> None:
+        for row in rows:
+            fp.write(json.dumps(row, ensure_ascii=False))
+            fp.write("\n")
 
 
 class XLSXInputPlugin:
@@ -100,7 +131,10 @@ class XLSXInputPlugin:
                         fieldnames[i]: values[i] if i < len(values) else None
                         for i in range(len(fieldnames))
                     }
-                    yield {key: ("" if value is None else value) for key, value in row.items()}
+                    yield {
+                        key: ("" if value is None else value)
+                        for key, value in row.items()
+                    }
 
             yield TableStream(rows=generator(), fieldnames=fieldnames)
         finally:

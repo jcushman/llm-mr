@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import click
 import llm
 from llm.cli import get_default_model
 
-from .registries import PluginContext, ProcessorRegistry, TableStream
+from .registries import PluginContext, TableStream, normalize_extension
 
 
 @dataclass
@@ -43,9 +45,188 @@ class FilterCondition:
         raise ValueError(f"Unsupported operator: {self.op}")
 
 
-def register_builtin_processors(registry: ProcessorRegistry) -> None:
-    registry.register(MapProcessor())
-    registry.register(ReduceProcessor())
+# ---------------------------------------------------------------------------
+# Shared CLI options
+# ---------------------------------------------------------------------------
+
+
+def _common_options(f):
+    """Options shared by map, reduce, and filter."""
+    f = click.argument("instruction")(f)
+    f = click.option(
+        "-i",
+        "--input",
+        "input_path",
+        type=click.Path(exists=True, dir_okay=False, path_type=Path),
+        default=None,
+        help="Input file path. Omit to read from stdin.",
+    )(f)
+    f = click.option(
+        "-p",
+        "--prompt",
+        "prompt_mode",
+        is_flag=True,
+        help="Treat instruction as a literal LLM prompt (run per item)",
+    )(f)
+    f = click.option(
+        "-e",
+        "--expression",
+        "expression_mode",
+        is_flag=True,
+        help="Treat instruction as a Python expression (deterministic)",
+    )(f)
+    f = click.option("-m", "--model", help="LLM model to use")(f)
+    f = click.option(
+        "--worker-model", help="Model for per-item LLM work (defaults to -m)"
+    )(f)
+    f = click.option(
+        "--planning-model", help="Model for interactive planning (defaults to -m)"
+    )(f)
+    f = click.option(
+        "-f",
+        "--format",
+        "format_",
+        default=None,
+        help="Default format for both input and output (csv, jsonl)",
+    )(f)
+    f = click.option(
+        "--input-format",
+        default=None,
+        help="Override input format (csv, jsonl)",
+    )(f)
+    f = click.option(
+        "--output-format",
+        default=None,
+        help="Override output format (csv, jsonl)",
+    )(f)
+    f = click.option(
+        "--where",
+        "filters",
+        multiple=True,
+        help="Pre-filter like status=active or score>=10",
+    )(f)
+    f = click.option(
+        "-n",
+        "--limit",
+        type=click.IntRange(1),
+        default=None,
+        help="Only process the first N items",
+    )(f)
+    f = click.option(
+        "--dry-run",
+        is_flag=True,
+        help="Show a sample prompt and exit without making LLM calls",
+    )(f)
+    f = click.option(
+        "-v",
+        "--verbose",
+        is_flag=True,
+        help="Print each prompt as it is sent to the model",
+    )(f)
+    return f
+
+
+def _validate_mode_flags(prompt_mode: bool, expression_mode: bool) -> str:
+    """Return the execution mode: 'prompt', 'expression', or 'interactive'."""
+    if prompt_mode and expression_mode:
+        raise click.UsageError("Cannot use both -p and -e")
+    if prompt_mode:
+        return "prompt"
+    if expression_mode:
+        return "expression"
+    return "interactive"
+
+
+def _resolve_formats(
+    input_path: Optional[Path],
+    output_path: Optional[Path],
+    format_: Optional[str],
+    input_format: Optional[str],
+    output_format: Optional[str],
+) -> Tuple[str, str]:
+    """Resolve input and output format names using the cascade.
+
+    Priority per direction: specific flag > file extension > general flag >
+    match the other end > JSONL fallback.
+    """
+    in_fmt = input_format
+    out_fmt = output_format
+
+    if in_fmt is None and input_path is not None:
+        ext = normalize_extension(input_path.suffix)
+        if ext:
+            in_fmt = ext
+    if out_fmt is None and output_path is not None:
+        ext = normalize_extension(output_path.suffix)
+        if ext:
+            out_fmt = ext
+
+    if in_fmt is None and format_ is not None:
+        in_fmt = format_
+    if out_fmt is None and format_ is not None:
+        out_fmt = format_
+
+    if in_fmt is None and out_fmt is not None:
+        in_fmt = out_fmt
+    if out_fmt is None and in_fmt is not None:
+        out_fmt = in_fmt
+
+    if in_fmt is None:
+        in_fmt = "jsonl"
+    if out_fmt is None:
+        out_fmt = "jsonl"
+
+    return in_fmt, out_fmt
+
+
+def _open_input(context: PluginContext, input_path: Optional[Path], in_fmt: str):
+    """Return (plugin, source) for the resolved input."""
+    if input_path is not None:
+        plugin = context.inputs.for_path(input_path)
+        return plugin, input_path
+    plugin = context.inputs.for_name(in_fmt)
+    return plugin, sys.stdin
+
+
+def _resolve_output(context: PluginContext, output_path: Optional[Path], out_fmt: str):
+    """Return (plugin, dest) for the resolved output."""
+    if output_path is not None:
+        plugin = context.outputs.for_path(output_path)
+        return plugin, output_path
+    plugin = context.outputs.for_name(out_fmt)
+    return plugin, sys.stdout
+
+
+def _stdin_guard(input_path: Optional[Path]) -> None:
+    """Error if reading from stdin but stdin is a TTY (nothing piped)."""
+    if input_path is None and sys.stdin.isatty():
+        raise click.UsageError(
+            "Provide -i <file> or pipe data to stdin."
+        )
+
+
+def _interactive_stdin_guard(mode: str, input_path: Optional[Path]) -> None:
+    """Error if interactive mode is used while reading data from stdin."""
+    if mode == "interactive" and input_path is None:
+        raise click.UsageError(
+            "Cannot use interactive mode when reading from stdin. "
+            "Use -p (prompt) or -e (expression)."
+        )
+
+
+def _resolve_worker_model(model: Optional[str], worker_model: Optional[str]):
+    """Resolve the model used for per-item LLM work."""
+    return resolve_model(worker_model or model)
+
+
+def _resolve_planner_model(planning_model: Optional[str], model: Optional[str]):
+    """Resolve the model used for interactive planning (one-shot)."""
+    return resolve_model(planning_model or model)
+
+
+# ---------------------------------------------------------------------------
+# Map
+# ---------------------------------------------------------------------------
 
 
 class MapProcessor:
@@ -53,15 +234,16 @@ class MapProcessor:
 
     def register_cli(self, group: click.Group, context: PluginContext) -> None:
         @group.command(name=self.name)
-        @click.argument("input_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-        @click.option("-p", "--prompt", required=True, help="Prompt describing the transformation")
+        @_common_options
         @click.option(
             "-o",
             "--output",
             type=click.Path(dir_okay=False, path_type=Path),
             help="Output path. Required unless --in-place is provided.",
         )
-        @click.option("--in-place", is_flag=True, help="Overwrite the input file in place")
+        @click.option(
+            "--in-place", is_flag=True, help="Overwrite the input file in place"
+        )
         @click.option(
             "-c",
             "--column",
@@ -71,86 +253,165 @@ class MapProcessor:
             help="Column to populate with LLM output",
         )
         @click.option(
-            "--where",
-            "filters",
-            multiple=True,
-            help="Row filter like status=active or score>=10",
-        )
-        @click.option(
             "--batch-size",
             type=click.IntRange(1),
             default=1,
             show_default=True,
-            help="Number of rows to include in a single prompt",
+            help="Number of rows per prompt",
         )
         @click.option(
             "--max-chars",
             type=click.IntRange(500, 200000),
             default=6000,
             show_default=True,
-            help="Maximum characters permitted in one prompt batch",
+            help="Max characters per prompt batch",
         )
         @click.option(
             "--few-shot",
             type=click.IntRange(0),
             default=0,
             show_default=True,
-            help="Use this many existing values as few-shot examples",
+            help="Use N existing values as few-shot examples",
         )
-        @click.option("--model", help="LLM model to use")
         @click.option(
-            "--smart-model",
-            help="Model used to synthesize deterministic expressions before prompting",
+            "--multiple",
+            is_flag=True,
+            help="Model emits a list per row; each item becomes its own row",
         )
-        @click.option("--key", help="API key to use for the primary model")
         @click.option(
-            "--smart-key",
-            help="API key for the smart model (defaults to the primary key if omitted)",
+            "-j",
+            "--parallel",
+            type=click.IntRange(1),
+            default=1,
+            show_default=True,
+            help="Concurrent batches",
+        )
+        @click.option(
+            "--repair", is_flag=True, help="Retry failed rows from the .err sidecar"
+        )
+        @click.option(
+            "--err",
+            "err_file",
+            type=click.Path(dir_okay=False, path_type=Path),
+            default=None,
+            help="Error sidecar path (default: <output>.err)",
         )
         def map_command(
-            input_path: Path,
-            prompt: str,
+            input_path: Optional[Path],
+            instruction: str,
+            prompt_mode: bool,
+            expression_mode: bool,
+            model: Optional[str],
+            worker_model: Optional[str],
+            planning_model: Optional[str],
+            format_: Optional[str],
+            input_format: Optional[str],
+            output_format: Optional[str],
+            filters: Sequence[str],
+            limit: Optional[int],
             output: Optional[Path],
             in_place: bool,
             target_column: str,
-            filters: Sequence[str],
             batch_size: int,
             max_chars: int,
             few_shot: int,
-            model: Optional[str],
-            smart_model: Optional[str],
-            key: Optional[str],
-            smart_key: Optional[str],
+            multiple: bool,
+            parallel: int,
+            repair: bool,
+            err_file: Optional[Path],
+            dry_run: bool,
+            verbose: bool,
         ) -> None:
-            if not output and not in_place:
-                raise click.UsageError("Provide --output or use --in-place")
+            if in_place and input_path is None:
+                raise click.UsageError("--in-place requires -i <file>")
             output_path = input_path if in_place else output
-            assert output_path is not None
 
-            input_plugin = context.inputs.for_path(input_path)
-            with input_plugin.open(input_path) as stream:
-                rows, fieldnames = _materialize(stream)
+            mode = _validate_mode_flags(prompt_mode, expression_mode)
+            _stdin_guard(input_path)
+            _interactive_stdin_guard(mode, input_path)
+
+            in_fmt, out_fmt = _resolve_formats(
+                input_path, output_path, format_, input_format, output_format
+            )
+            err_path = err_file if err_file is not None else _err_path_for(output_path)
+
+            if repair:
+                if err_path is None:
+                    raise click.UsageError(
+                        "--repair requires --output or --err"
+                    )
+                if output_path is None:
+                    raise click.UsageError(
+                        "--repair requires --output to merge results"
+                    )
+                _map_repair(
+                    context,
+                    output_path,
+                    err_path,
+                    instruction,
+                    target_column,
+                    batch_size,
+                    max_chars,
+                    few_shot,
+                    worker_model or model,
+                    multiple,
+                    parallel,
+                )
+                return
 
             parsed_filters = [parse_filter(expr) for expr in filters]
+
+            # Streaming path: expression mode avoids full materialization
+            if mode == "expression" and not in_place:
+                deterministic = _compile_expression(instruction)
+                input_plugin, source = _open_input(context, input_path, in_fmt)
+                output_plugin, dest = _resolve_output(context, output_path, out_fmt)
+                with input_plugin.open(source) as stream:
+                    fieldnames = list(stream.fieldnames or [])
+                    if target_column not in fieldnames:
+                        fieldnames.append(target_column)
+                    total, written = _stream_map_expression(
+                        stream, deterministic, target_column, parsed_filters,
+                        limit, multiple, output_plugin, dest, fieldnames,
+                    )
+                click.echo(
+                    f"Wrote {written} rows"
+                    + (f" to {output_path}" if output_path else ""),
+                    err=True,
+                )
+                return
+
+            input_plugin, source = _open_input(context, input_path, in_fmt)
+            with input_plugin.open(source) as stream:
+                rows, fieldnames = _materialize(stream, limit=limit)
+
             target_rows = filter_rows(rows, parsed_filters)
 
             if target_column not in fieldnames:
                 fieldnames.append(target_column)
-            for row in rows:
-                row.setdefault(target_column, "")
 
             deterministic = None
-            if smart_model:
-                deterministic = _attempt_deterministic(
-                    prompt,
+            prompt_text = instruction
+            if mode == "expression":
+                deterministic = _compile_expression(instruction)
+            elif mode == "interactive":
+                plan = _interactive_plan_map(
+                    instruction,
                     target_column,
                     fieldnames,
-                    smart_model,
-                    smart_key or key,
-                    few_shot_examples=_extract_few_shot_examples(rows, target_column, few_shot),
+                    planning_model,
+                    model,
+                    _extract_few_shot_examples(rows, target_column, few_shot),
                 )
-                if deterministic:
-                    click.echo(f"Using deterministic expression: {deterministic.expression}")
+                if plan is None:
+                    raise SystemExit(0)
+                elif isinstance(plan, str):
+                    prompt_text = plan
+                else:
+                    deterministic = plan
+
+            row_id_map = {id(row): i for i, row in enumerate(rows)}
+            processed_indices: Set[int] = set()
 
             if deterministic:
                 for row in target_rows:
@@ -158,28 +419,74 @@ class MapProcessor:
                         continue
                     try:
                         row[target_column] = deterministic.evaluate(row)
-                    except Exception as exc:  # pragma: no cover - runtime safety
-                        raise click.ClickException(f"Deterministic expression failed: {exc}")
+                        processed_indices.add(row_id_map[id(row)])
+                    except Exception as exc:
+                        raise click.ClickException(f"Expression failed: {exc}")
             else:
-                model_obj = resolve_model(model, key)
-                few_shot_examples = _extract_few_shot_examples(rows, target_column, few_shot)
-                pending_rows = [
-                    row for row in target_rows if not _has_value(row.get(target_column))
-                ]
-                if not pending_rows:
-                    click.echo("No rows required LLM processing; nothing to do")
-                else:
-                    for batch in _prepare_batches(pending_rows, batch_size, max_chars):
-                        response = model_obj.prompt(
-                            _build_map_prompt(prompt, target_column, batch, few_shot_examples)
-                        )
-                        values = _parse_map_response(str(response), len(batch))
-                        for row, value in zip(batch, values):
-                            row[target_column] = value
+                worker = _resolve_worker_model(model, worker_model)
+                _require_schema_support(worker)
 
-            output_plugin = context.outputs.for_path(output_path)
-            output_plugin.write(output_path, rows, fieldnames)
-            click.echo(f"Wrote {len(rows)} rows to {output_path}")
+                few_shot_examples = _extract_few_shot_examples(
+                    rows, target_column, few_shot
+                )
+                pending = [
+                    (row_id_map[id(row)], row)
+                    for row in target_rows
+                    if not _has_value(row.get(target_column))
+                ]
+                processed_indices = {i for i, _ in pending}
+                if not pending:
+                    click.echo("No rows required LLM processing; nothing to do", err=True)
+                else:
+                    if dry_run:
+                        _dry_run_map(
+                            pending,
+                            prompt_text,
+                            target_column,
+                            few_shot_examples,
+                            multiple,
+                            batch_size,
+                            max_chars,
+                        )
+                        return
+                    _clear_err_file(err_path)
+                    failed = _run_map_batches(
+                        pending,
+                        worker,
+                        prompt_text,
+                        target_column,
+                        few_shot_examples,
+                        multiple,
+                        batch_size,
+                        max_chars,
+                        parallel,
+                        err_path,
+                        verbose,
+                    )
+                    if failed:
+                        click.echo(
+                            f"Warning: {failed} batches failed"
+                            + (f"; see {err_path} — rerun with --repair"
+                               if err_path else "")
+                            ,
+                            err=True,
+                        )
+
+            if multiple:
+                rows = _expand_multiple_rows(rows, target_column, processed_indices)
+
+            output_plugin, dest = _resolve_output(context, output_path, out_fmt)
+            output_plugin.write(dest, rows, fieldnames)
+            click.echo(f"Wrote {len(rows)} rows" + (f" to {output_path}" if output_path else ""), err=True)
+            if not deterministic and pending:
+                pending_rows = [row for _, row in pending]
+                n_batches = len(_prepare_batches(pending_rows, batch_size, max_chars))
+                _echo_log_tip(n_batches)
+
+
+# ---------------------------------------------------------------------------
+# Reduce
+# ---------------------------------------------------------------------------
 
 
 class ReduceProcessor:
@@ -187,8 +494,7 @@ class ReduceProcessor:
 
     def register_cli(self, group: click.Group, context: PluginContext) -> None:
         @group.command(name=self.name)
-        @click.argument("input_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-        @click.option("-p", "--prompt", required=True, help="Prompt describing the reduction")
+        @_common_options
         @click.option(
             "--group-by",
             "group_by",
@@ -197,17 +503,11 @@ class ReduceProcessor:
             help="Column(s) to group by",
         )
         @click.option(
-            "--where",
-            "filters",
-            multiple=True,
-            help="Row filter like status=active or score>=10",
-        )
-        @click.option(
             "-o",
             "--output",
             type=click.Path(dir_okay=False, path_type=Path),
-            required=True,
-            help="Destination path for reduced output",
+            default=None,
+            help="Destination path for reduced output (default: stdout)",
         )
         @click.option(
             "-c",
@@ -217,44 +517,810 @@ class ReduceProcessor:
             show_default=True,
             help="Column name for reduced value",
         )
-        @click.option("--model", help="LLM model to use")
-        @click.option("--key", help="API key for the model")
         @click.option(
             "--max-chars",
             type=click.IntRange(500, 200000),
             default=8000,
             show_default=True,
-            help="Maximum characters permitted in a single reduction prompt",
+            help="Max characters per reduction prompt",
+        )
+        @click.option(
+            "-j",
+            "--parallel",
+            type=click.IntRange(1),
+            default=1,
+            show_default=True,
+            help="Concurrent groups",
+        )
+        @click.option(
+            "--repair", is_flag=True, help="Retry failed groups from the .err sidecar"
+        )
+        @click.option(
+            "--err",
+            "err_file",
+            type=click.Path(dir_okay=False, path_type=Path),
+            default=None,
+            help="Error sidecar path (default: <output>.err)",
         )
         def reduce_command(
-            input_path: Path,
-            prompt: str,
-            group_by: Sequence[str],
-            filters: Sequence[str],
-            output: Path,
-            result_column: str,
+            input_path: Optional[Path],
+            instruction: str,
+            prompt_mode: bool,
+            expression_mode: bool,
             model: Optional[str],
-            key: Optional[str],
+            worker_model: Optional[str],
+            planning_model: Optional[str],
+            format_: Optional[str],
+            input_format: Optional[str],
+            output_format: Optional[str],
+            filters: Sequence[str],
+            limit: Optional[int],
+            group_by: Sequence[str],
+            output: Optional[Path],
+            result_column: str,
             max_chars: int,
+            parallel: int,
+            repair: bool,
+            err_file: Optional[Path],
+            dry_run: bool,
+            verbose: bool,
         ) -> None:
-            input_plugin = context.inputs.for_path(input_path)
-            with input_plugin.open(input_path) as stream:
-                rows, _ = _materialize(stream)
+            mode = _validate_mode_flags(prompt_mode, expression_mode)
+            _stdin_guard(input_path)
+            _interactive_stdin_guard(mode, input_path)
+
+            in_fmt, out_fmt = _resolve_formats(
+                input_path, output, format_, input_format, output_format
+            )
+            err_path = err_file if err_file is not None else _err_path_for(output)
+
+            input_plugin, source = _open_input(context, input_path, in_fmt)
+            with input_plugin.open(source) as stream:
+                rows, fieldnames = _materialize(stream)
+
+            for col in group_by:
+                if col not in fieldnames:
+                    raise click.ClickException(
+                        f"Column '{col}' specified in --group-by does not exist. "
+                        f"Available columns: {', '.join(fieldnames)}"
+                    )
 
             parsed_filters = [parse_filter(expr) for expr in filters]
             filtered_rows = filter_rows(rows, parsed_filters)
 
             groups = _group_rows(filtered_rows, group_by)
-            model_obj = resolve_model(model, key)
-            results: List[Dict[str, Any]] = []
-            for group_key, group_rows in groups.items():
-                value = _reduce_rows(model_obj, prompt, group_rows, group_by, max_chars)
-                result_row = {"group": group_key, result_column: value}
-                results.append(result_row)
+            if limit is not None:
+                groups = dict(list(groups.items())[:limit])
 
-            output_plugin = context.outputs.for_path(output)
-            output_plugin.write(output, results, ["group", result_column])
-            click.echo(f"Wrote {len(results)} group results to {output}")
+            if repair:
+                if err_path is None:
+                    raise click.UsageError(
+                        "--repair requires --output or --err"
+                    )
+                if output is None:
+                    raise click.UsageError(
+                        "--repair requires --output to merge results"
+                    )
+                _reduce_repair(
+                    context,
+                    output,
+                    err_path,
+                    groups,
+                    instruction,
+                    group_by,
+                    result_column,
+                    worker_model or model,
+                    max_chars,
+                    parallel,
+                )
+                return
+
+            deterministic = None
+            prompt_text = instruction
+            if mode == "expression":
+                deterministic = _compile_reduce_expression(instruction)
+            elif mode == "interactive":
+                sample_group = next(iter(groups.values()), [])
+                plan = _interactive_plan_reduce(
+                    instruction,
+                    result_column,
+                    fieldnames,
+                    planning_model,
+                    model,
+                    sample_group,
+                )
+                if plan is None:
+                    raise SystemExit(0)
+                elif isinstance(plan, str):
+                    prompt_text = plan
+                else:
+                    deterministic = plan
+
+            if deterministic:
+                results: List[Dict[str, Any]] = []
+                for group_key, group_rows in groups.items():
+                    try:
+                        value = deterministic.evaluate(group_rows)
+                    except Exception as exc:
+                        raise click.ClickException(
+                            f"Expression failed on group '{group_key}': {exc}"
+                        )
+                    results.append({"group": group_key, result_column: value})
+                click.echo(f"Reduced {len(results)} groups deterministically", err=True)
+            else:
+                worker = _resolve_worker_model(model, worker_model)
+                _require_schema_support(worker)
+
+                group_items = list(groups.items())
+
+                if dry_run:
+                    _dry_run_reduce(
+                        group_items,
+                        prompt_text,
+                        group_by,
+                        max_chars,
+                        result_column,
+                    )
+                    return
+
+                click.echo(f"Reducing {len(group_items)} groups (parallel={parallel})", err=True)
+                _clear_err_file(err_path)
+                results, failed = _run_reduce_groups(
+                    group_items,
+                    worker,
+                    prompt_text,
+                    group_by,
+                    max_chars,
+                    result_column,
+                    parallel,
+                    err_path,
+                    verbose,
+                )
+                if failed:
+                    click.echo(
+                        f"Warning: {failed}/{len(group_items)} groups failed"
+                        + (f"; see {err_path} — rerun with --repair"
+                           if err_path else ""),
+                        err=True,
+                    )
+
+            output_plugin, dest = _resolve_output(context, output, out_fmt)
+            output_plugin.write(dest, results, ["group", result_column])
+            click.echo(
+                f"Wrote {len(results)} group results"
+                + (f" to {output}" if output else ""),
+                err=True,
+            )
+            if not deterministic:
+                _echo_log_tip(len(group_items))
+
+
+# ---------------------------------------------------------------------------
+# Filter
+# ---------------------------------------------------------------------------
+
+
+class FilterProcessor:
+    name = "filter"
+
+    def register_cli(self, group: click.Group, context: PluginContext) -> None:
+        @group.command(name=self.name)
+        @_common_options
+        @click.option(
+            "-o",
+            "--output",
+            type=click.Path(dir_okay=False, path_type=Path),
+            default=None,
+            help="Output path for filtered rows (default: stdout)",
+        )
+        @click.option(
+            "--batch-size",
+            type=click.IntRange(1),
+            default=1,
+            show_default=True,
+            help="Number of rows per prompt",
+        )
+        @click.option(
+            "--max-chars",
+            type=click.IntRange(500, 200000),
+            default=6000,
+            show_default=True,
+            help="Max characters per prompt batch",
+        )
+        @click.option(
+            "-j",
+            "--parallel",
+            type=click.IntRange(1),
+            default=1,
+            show_default=True,
+            help="Concurrent batches",
+        )
+        def filter_command(
+            input_path: Optional[Path],
+            instruction: str,
+            prompt_mode: bool,
+            expression_mode: bool,
+            model: Optional[str],
+            worker_model: Optional[str],
+            planning_model: Optional[str],
+            format_: Optional[str],
+            input_format: Optional[str],
+            output_format: Optional[str],
+            filters: Sequence[str],
+            limit: Optional[int],
+            output: Optional[Path],
+            batch_size: int,
+            max_chars: int,
+            parallel: int,
+            dry_run: bool,
+            verbose: bool,
+        ) -> None:
+            mode = _validate_mode_flags(prompt_mode, expression_mode)
+            _stdin_guard(input_path)
+            _interactive_stdin_guard(mode, input_path)
+
+            in_fmt, out_fmt = _resolve_formats(
+                input_path, output, format_, input_format, output_format
+            )
+
+            parsed_filters = [parse_filter(expr) for expr in filters]
+
+            # Streaming path: expression mode avoids full materialization
+            if mode == "expression":
+                deterministic = _compile_expression(instruction)
+                input_plugin, source = _open_input(context, input_path, in_fmt)
+                output_plugin, dest = _resolve_output(context, output, out_fmt)
+                with input_plugin.open(source) as stream:
+                    fieldnames = list(stream.fieldnames or [])
+                    candidates, kept_count = _stream_filter_expression(
+                        stream, deterministic, parsed_filters,
+                        limit, output_plugin, dest, fieldnames,
+                    )
+                click.echo(
+                    f"Kept {kept_count}/{candidates} rows"
+                    + (f" → {output}" if output else ""),
+                    err=True,
+                )
+                return
+
+            input_plugin, source = _open_input(context, input_path, in_fmt)
+            with input_plugin.open(source) as stream:
+                rows, fieldnames = _materialize(stream, limit=limit)
+
+            rows = filter_rows(rows, parsed_filters)
+
+            deterministic = None
+            prompt_text = instruction
+            if mode == "interactive":
+                plan = _interactive_plan_filter(
+                    instruction,
+                    fieldnames,
+                    planning_model,
+                    model,
+                    rows[:3],
+                )
+                if plan is None:
+                    raise SystemExit(0)
+                elif isinstance(plan, str):
+                    prompt_text = plan
+                else:
+                    deterministic = plan
+
+            if deterministic:
+                kept = [row for row in rows if deterministic.evaluate(row)]
+            else:
+                worker = _resolve_worker_model(model, worker_model)
+                _require_schema_support(worker)
+
+                if dry_run:
+                    _dry_run_filter(rows, prompt_text, batch_size, max_chars)
+                    return
+
+                kept = _run_filter_llm(
+                    rows,
+                    worker,
+                    prompt_text,
+                    batch_size,
+                    max_chars,
+                    parallel,
+                    verbose,
+                )
+
+            output_plugin, dest = _resolve_output(context, output, out_fmt)
+            output_plugin.write(dest, kept, fieldnames)
+            click.echo(
+                f"Kept {len(kept)}/{len(rows)} rows"
+                + (f" → {output}" if output else ""),
+                err=True,
+            )
+            if not deterministic:
+                n_batches = len(_prepare_batches(rows, batch_size, max_chars))
+                _echo_log_tip(n_batches)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — model resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_model(model_name: Optional[str]):
+    model_id = model_name or get_default_model()
+    model_obj = llm.get_model(model_id)
+    if model_obj.needs_key:
+        model_obj.key = llm.get_key("", model_obj.needs_key, model_obj.key_env_var)
+    return model_obj
+
+
+def _require_schema_support(model_obj) -> None:
+    if not getattr(model_obj, "supports_schema", False):
+        raise click.ClickException(
+            f"Model '{model_obj.model_id}' does not support schemas. "
+            f"Please use a model that supports structured output. "
+            f"Run llm models --schemas to see which models support schemas."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic expressions
+# ---------------------------------------------------------------------------
+
+_EXPR_BUILTINS = {
+    "__builtins__": {},
+    "len": len,
+    "int": int,
+    "float": float,
+    "str": str,
+    "min": min,
+    "max": max,
+    "abs": abs,
+    "round": round,
+    "sorted": sorted,
+    "bool": bool,
+    "list": list,
+    "tuple": tuple,
+    "set": set,
+    "dict": dict,
+    "sum": sum,
+    "any": any,
+    "all": all,
+    "enumerate": enumerate,
+    "zip": zip,
+    "map": map,
+    "filter": filter,
+}
+
+
+@dataclass
+class DeterministicExpression:
+    expression: str
+    code: Any
+
+    def evaluate(self, row: Dict[str, Any]) -> Any:
+        return eval(self.code, dict(_EXPR_BUILTINS), {"row": row})
+
+
+@dataclass
+class DeterministicReduceExpression:
+    expression: str
+    code: Any
+
+    def evaluate(self, rows: List[Dict[str, Any]]) -> Any:
+        return eval(self.code, dict(_EXPR_BUILTINS), {"rows": rows})
+
+
+def _compile_expression(expression: str) -> DeterministicExpression:
+    try:
+        code = compile(expression, "<expression>", "eval")
+    except SyntaxError as exc:
+        raise click.ClickException(f"Invalid Python expression: {exc}")
+    return DeterministicExpression(expression=expression, code=code)
+
+
+def _compile_reduce_expression(expression: str) -> DeterministicReduceExpression:
+    try:
+        code = compile(expression, "<expression>", "eval")
+    except SyntaxError as exc:
+        raise click.ClickException(f"Invalid Python expression: {exc}")
+    return DeterministicReduceExpression(expression=expression, code=code)
+
+
+# ---------------------------------------------------------------------------
+# Interactive planning
+# ---------------------------------------------------------------------------
+
+_PLAN_INSTRUCTIONS = (
+    "Return ONLY a JSON object. "
+    'If the task can be done deterministically, set "deterministic" to true '
+    'and provide a Python "expression". '
+    'If it requires LLM reasoning, set "deterministic" to false '
+    'and provide a "prompt" — a clear, specific instruction to send to an LLM '
+    "for each item."
+)
+
+
+def _interactive_plan_map(
+    instruction: str,
+    target_column: str,
+    fieldnames: Sequence[str],
+    planning_model: Optional[str],
+    model_name: Optional[str],
+    few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
+) -> Union[DeterministicExpression, str, None]:
+    try:
+        model_obj = _resolve_planner_model(planning_model, model_name)
+    except Exception:
+        return None
+    system = "\n".join(
+        [
+            "You translate spreadsheet instructions into either a deterministic Python "
+            "expression or a per-row LLM prompt.",
+            "Columns available: " + ", ".join(fieldnames),
+            f"Target column: '{target_column}'.",
+            _PLAN_INSTRUCTIONS,
+            "When deterministic is true, 'expression' must be a Python expression "
+            "using the variable 'row' (a dict).",
+            "Available builtins: len, int, float, str, min, max, abs, round, sorted, "
+            "bool, list, tuple, set, dict, sum, any, all, enumerate, zip, map, filter.",
+        ]
+    )
+    payload = {
+        "instruction": instruction,
+        "examples": [
+            {"input": row, "output": value} for row, value in few_shot_examples
+        ],
+    }
+    response = model_obj.prompt(system + "\n" + json.dumps(payload, ensure_ascii=False))
+    return _confirm_plan(response, instruction, "row")
+
+
+def _interactive_plan_reduce(
+    instruction: str,
+    result_column: str,
+    fieldnames: Sequence[str],
+    planning_model: Optional[str],
+    model_name: Optional[str],
+    sample_rows: List[Dict[str, Any]],
+) -> Union[DeterministicReduceExpression, str, None]:
+    try:
+        model_obj = _resolve_planner_model(planning_model, model_name)
+    except Exception:
+        return None
+    system = "\n".join(
+        [
+            "You translate spreadsheet reduction instructions into either a deterministic "
+            "Python expression or a per-group LLM prompt.",
+            "Columns available: " + ", ".join(fieldnames),
+            f"Result column: '{result_column}'.",
+            _PLAN_INSTRUCTIONS,
+            "When deterministic is true, 'expression' must be a Python expression "
+            "using the variable 'rows' (a list of dicts).",
+            "Available builtins: len, int, float, str, min, max, abs, round, sorted, "
+            "bool, list, tuple, set, dict, sum, any, all, enumerate, zip, map, filter.",
+        ]
+    )
+    payload = {
+        "instruction": instruction,
+        "sample_rows": sample_rows[:3],
+    }
+    response = model_obj.prompt(system + "\n" + json.dumps(payload, ensure_ascii=False))
+    return _confirm_plan(response, instruction, "rows", reduce=True)
+
+
+def _interactive_plan_filter(
+    instruction: str,
+    fieldnames: Sequence[str],
+    planning_model: Optional[str],
+    model_name: Optional[str],
+    sample_rows: List[Dict[str, Any]],
+) -> Union[DeterministicExpression, str, None]:
+    try:
+        model_obj = _resolve_planner_model(planning_model, model_name)
+    except Exception:
+        return None
+    system = "\n".join(
+        [
+            "You translate natural language filter descriptions into either a deterministic "
+            "Python expression or a per-row LLM prompt.",
+            "Columns available: " + ", ".join(fieldnames),
+            "The expression should return True for rows that should be KEPT.",
+            _PLAN_INSTRUCTIONS,
+            "When deterministic is true, 'expression' must be a Python expression "
+            "using the variable 'row' (a dict).",
+            "Available builtins: len, int, float, str, min, max, abs, round, sorted, "
+            "bool, list, tuple, set, dict, sum, any, all, enumerate, zip, map, filter.",
+        ]
+    )
+    payload = {
+        "instruction": instruction,
+        "sample_rows": sample_rows[:3],
+    }
+    response = model_obj.prompt(system + "\n" + json.dumps(payload, ensure_ascii=False))
+    return _confirm_plan(response, instruction, "row")
+
+
+def _confirm_plan(
+    response,
+    instruction: str,
+    var_name: str,
+    reduce: bool = False,
+) -> Union[DeterministicExpression, DeterministicReduceExpression, str, None]:
+    """Parse the planner response, confirm with the user, and return the result.
+
+    Returns a DeterministicExpression/DeterministicReduceExpression if the user
+    accepts an expression, a str prompt if the user accepts a prompt, or None
+    if the user declines.
+    """
+    try:
+        data = json.loads(str(response))
+    except json.JSONDecodeError:
+        data = {}
+
+    expression = data.get("expression") if data.get("deterministic") else None
+    suggested_prompt = data.get("prompt")
+
+    if isinstance(expression, str):
+        try:
+            code = compile(expression, "<deterministic>", "eval")
+        except SyntaxError:
+            expression = None
+        else:
+            if click.confirm(
+                f"Use deterministic expression?\n  {expression}", default=True
+            ):
+                click.echo(f"Using deterministic expression: {expression}", err=True)
+                if reduce:
+                    return DeterministicReduceExpression(
+                        expression=expression, code=code
+                    )
+                return DeterministicExpression(expression=expression, code=code)
+
+    item_label = "group" if reduce else "row"
+    prompt_text = suggested_prompt if isinstance(suggested_prompt, str) else instruction
+    if not click.confirm(
+        f"Run as prompt per {item_label}?\n  {prompt_text}", default=True
+    ):
+        return None
+    return prompt_text
+
+
+# ---------------------------------------------------------------------------
+# Filter via LLM
+# ---------------------------------------------------------------------------
+
+
+def _run_filter_llm(
+    rows: List[Dict[str, Any]],
+    model_obj,
+    instruction: str,
+    batch_size: int,
+    max_chars: int,
+    parallel: int,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    """Classify each row with the LLM and keep rows where result is truthy."""
+    batches = _prepare_batches(rows, batch_size, max_chars)
+
+    def _process_one(batch):
+        prompt_text = _build_filter_prompt(instruction, batch)
+        schema = _build_filter_schema(batch)
+        if verbose:
+            _echo_verbose(prompt_text)
+        response = model_obj.prompt(prompt_text, schema=schema)
+        return _parse_filter_response(response.text(), len(batch))
+
+    results: List[bool] = []
+    if parallel == 1:
+        for i, batch in enumerate(batches):
+            verdicts = _process_one(batch)
+            results.extend(verdicts)
+            click.echo(f"  Filtered batch {i + 1}/{len(batches)}", err=True)
+    else:
+        batch_verdicts: Dict[int, List[bool]] = {}
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(_process_one, batch): i
+                for i, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                batch_verdicts[idx] = future.result()
+                click.echo(f"  Filtered batch {idx + 1}/{len(batches)}", err=True)
+        for i in range(len(batches)):
+            results.extend(batch_verdicts[i])
+
+    return [row for row, keep in zip(rows, results) if keep]
+
+
+def _build_filter_prompt(instruction: str, rows: Sequence[Dict[str, Any]]) -> str:
+    lines = [
+        "You are filtering spreadsheet rows based on a criterion.",
+        "<spreadsheet_rows>",
+    ]
+    for i, row in enumerate(rows):
+        lines.append(f"<row_{i}>")
+        lines.append(json.dumps(row, ensure_ascii=False))
+        lines.append(f"</row_{i}>")
+    lines.append("</spreadsheet_rows>")
+    lines.append("<filter_criterion>")
+    lines.append(instruction)
+    lines.append("</filter_criterion>")
+    lines.append(
+        "For each row, respond with 'keep' if the row matches the criterion, "
+        "or 'discard' if it does not."
+    )
+    return "\n".join(lines)
+
+
+def _build_filter_schema(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    properties = {}
+    required = []
+    for i in range(len(rows)):
+        row_key = f"row_{i}"
+        required.append(row_key)
+        properties[row_key] = {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["keep", "discard"],
+                }
+            },
+            "required": ["verdict"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "title": "FilterResponse",
+    }
+
+
+def _parse_filter_response(response: str, expected: int) -> List[bool]:
+    response = response.strip()
+    if not response:
+        raise click.ClickException("Model returned an empty filter response")
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"Filter response was not valid JSON: {response}"
+        ) from exc
+    verdicts = []
+    for i in range(expected):
+        row_key = f"row_{i}"
+        if row_key not in data:
+            raise click.ClickException(f"Missing '{row_key}' in filter response")
+        verdict = data[row_key].get("verdict", "").lower()
+        verdicts.append(verdict == "keep")
+    return verdicts
+
+
+# ---------------------------------------------------------------------------
+# Reduce helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_reduce_groups(
+    group_items: List[Tuple[str, List[Dict[str, Any]]]],
+    model_obj,
+    prompt: str,
+    group_by: Sequence[str],
+    max_chars: int,
+    result_column: str,
+    parallel: int,
+    err_path: Path,
+    verbose: bool = False,
+) -> Tuple[List[Dict[str, Any]], int]:
+    def _reduce_one(group_key, group_rows):
+        value = _reduce_rows(
+            model_obj, prompt, group_rows, group_by, max_chars, result_column, verbose
+        )
+        return {"group": group_key, result_column: value}
+
+    results: List[Dict[str, Any]] = []
+    failed = 0
+
+    if parallel == 1:
+        for i, (group_key, group_rows) in enumerate(group_items):
+            try:
+                results.append(_reduce_one(group_key, group_rows))
+            except Exception as exc:
+                failed += 1
+                _append_error(err_path, {"group_key": group_key, "error": str(exc)})
+                click.echo(
+                    f"  Group {i + 1}/{len(group_items)} failed: {exc}", err=True
+                )
+                continue
+            click.echo(f"  Completed group {i + 1}/{len(group_items)}", err=True)
+    else:
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(_reduce_one, gk, gr): (i, gk)
+                for i, (gk, gr) in enumerate(group_items)
+            }
+            completed = 0
+            for future in as_completed(futures):
+                group_idx, group_key = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    failed += 1
+                    _append_error(err_path, {"group_key": group_key, "error": str(exc)})
+                    click.echo(
+                        f"  Group {group_idx + 1}/{len(group_items)} failed: {exc}",
+                        err=True,
+                    )
+                    continue
+                completed += 1
+                click.echo(f"  Completed group {completed}/{len(group_items)}", err=True)
+
+    return results, failed
+
+
+def _reduce_repair(
+    context: PluginContext,
+    output: Path,
+    err_path: Path,
+    groups: Dict[str, List[Dict[str, Any]]],
+    prompt: str,
+    group_by: Sequence[str],
+    result_column: str,
+    model: Optional[str],
+    max_chars: int,
+    parallel: int,
+) -> None:
+    error_records = _read_errors(err_path)
+    if not error_records:
+        click.echo("No errors to repair; nothing to do", err=True)
+        return
+
+    failed_keys = {r["group_key"] for r in error_records}
+    pending_groups = [(k, v) for k, v in groups.items() if k in failed_keys]
+
+    if not pending_groups:
+        click.echo("No matching groups to repair", err=True)
+        _clear_err_file(err_path)
+        return
+
+    existing_results: List[Dict[str, Any]] = []
+    if output.exists():
+        try:
+            output_input_plugin = context.inputs.for_path(output)
+            with output_input_plugin.open(output) as stream:
+                existing_rows, _ = _materialize(stream)
+            existing_results = list(existing_rows)
+        except Exception:
+            pass
+
+    model_obj = resolve_model(model)
+    _require_schema_support(model_obj)
+
+    _clear_err_file(err_path)
+    click.echo(f"Repairing {len(pending_groups)} groups (parallel={parallel})", err=True)
+    new_results, failed = _run_reduce_groups(
+        pending_groups,
+        model_obj,
+        prompt,
+        group_by,
+        max_chars,
+        result_column,
+        parallel,
+        err_path,
+    )
+
+    if failed:
+        click.echo(f"Warning: {failed} groups still failing; see {err_path}", err=True)
+
+    merged = existing_results + new_results
+    output_plugin = context.outputs.for_path(output)
+    output_plugin.write(output, merged, ["group", result_column])
+    click.echo(f"Wrote {len(merged)} group results to {output}", err=True)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — parsing, filtering, batching
+# ---------------------------------------------------------------------------
 
 
 def _coerce_numeric(value: Any) -> Any:
@@ -268,7 +1334,7 @@ def _coerce_numeric(value: Any) -> Any:
             if "." in value:
                 return float(value)
             return int(value)
-        except ValueError as exc:  # pragma: no cover - defensive
+        except ValueError as exc:
             raise ValueError("Not numeric") from exc
     return value
 
@@ -283,7 +1349,9 @@ def parse_filter(expr: str) -> FilterCondition:
     )
 
 
-def filter_rows(rows: List[Dict[str, Any]], filters: Sequence[FilterCondition]) -> List[Dict[str, Any]]:
+def filter_rows(
+    rows: List[Dict[str, Any]], filters: Sequence[FilterCondition]
+) -> List[Dict[str, Any]]:
     if not filters:
         return rows
     return [row for row in rows if all(f.matches(row) for f in filters)]
@@ -297,70 +1365,36 @@ def _has_value(value: Any) -> bool:
     return True
 
 
-def resolve_model(model_name: Optional[str], key: Optional[str]):
-    model_id = model_name or get_default_model()
-    model_obj = llm.get_model(model_id)
-    if model_obj.needs_key:
-        model_obj.key = llm.get_key(key, model_obj.needs_key, model_obj.key_env_var)
-    return model_obj
+def _err_path_for(output_path: Optional[Path]) -> Optional[Path]:
+    if output_path is None:
+        return None
+    return Path(str(output_path) + ".err")
 
 
-@dataclass
-class DeterministicExpression:
-    expression: str
-    code: Any
-
-    def evaluate(self, row: Dict[str, Any]) -> Any:
-        return eval(self.code, {"__builtins__": {}}, {"row": row})
+def _clear_err_file(err_path: Optional[Path]) -> None:
+    if err_path is not None and err_path.exists():
+        err_path.unlink()
 
 
-def _attempt_deterministic(
-    prompt: str,
-    target_column: str,
-    fieldnames: Sequence[str],
-    smart_model_name: str,
-    key: Optional[str],
-    few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
-) -> Optional[DeterministicExpression]:
-    try:
-        model_obj = resolve_model(smart_model_name, key)
-    except Exception:
-        return None
-    instructions = [
-        "You translate spreadsheet prompts into deterministic Python expressions.",
-        "Columns available: " + ", ".join(fieldnames),
-        f"The expression should compute the value for the column '{target_column}'.",
-        "Return ONLY a JSON object with keys 'expression' and 'deterministic'.",
-        "If the prompt cannot be answered deterministically, set deterministic to false.",
-        "When deterministic is true, 'expression' must be a Python expression using the variable 'row'.",
-    ]
-    payload = {
-        "prompt": prompt,
-        "examples": [
-            {"input": row, "output": value} for row, value in few_shot_examples
-        ],
-    }
-    response = model_obj.prompt(
-        "\n".join(instructions) + "\n" + json.dumps(payload, ensure_ascii=False)
-    )
-    try:
-        data = json.loads(str(response))
-    except json.JSONDecodeError:
-        return None
-    if not data or not data.get("deterministic"):
-        return None
-    expression = data.get("expression")
-    if not isinstance(expression, str):
-        return None
-    try:
-        code = compile(expression, "<deterministic>", "eval")
-    except SyntaxError:
-        return None
-    if not click.confirm(
-        f"Use deterministic expression for column '{target_column}'?\n{expression}", default=True
-    ):
-        return None
-    return DeterministicExpression(expression=expression, code=code)
+def _append_error(err_path: Optional[Path], record: Dict[str, Any]) -> None:
+    line = json.dumps(record, ensure_ascii=False)
+    if err_path is not None:
+        with err_path.open("a", encoding="utf-8") as fp:
+            fp.write(line + "\n")
+    else:
+        click.echo(line, err=True)
+
+
+def _read_errors(err_path: Path) -> List[Dict[str, Any]]:
+    if not err_path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    with err_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
 
 def _extract_few_shot_examples(
@@ -400,15 +1434,180 @@ def _prepare_batches(
     return batches
 
 
+# ---------------------------------------------------------------------------
+# Map prompt/schema/response
+# ---------------------------------------------------------------------------
+
+
+def _process_batch(
+    model_obj,
+    prompt: str,
+    target_column: str,
+    batch: List[Dict[str, Any]],
+    few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
+    multiple: bool,
+    verbose: bool = False,
+) -> None:
+    prompt_text = _build_map_prompt(
+        prompt, target_column, batch, few_shot_examples, multiple
+    )
+    schema = _build_map_schema(batch, target_column, multiple)
+    if verbose:
+        _echo_verbose(prompt_text)
+    response = model_obj.prompt(prompt_text, schema=schema)
+    values = _parse_map_response(response.text(), target_column, len(batch), multiple)
+    for row, value in zip(batch, values):
+        row[target_column] = value
+
+
+def _run_map_batches(
+    pending: List[Tuple[int, Dict[str, Any]]],
+    model_obj,
+    prompt: str,
+    target_column: str,
+    few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
+    multiple: bool,
+    batch_size: int,
+    max_chars: int,
+    parallel: int,
+    err_path: Path,
+    verbose: bool = False,
+) -> int:
+    pending_indices = [i for i, _ in pending]
+    pending_rows = [row for _, row in pending]
+    batches = _prepare_batches(pending_rows, batch_size, max_chars)
+
+    idx_offset = 0
+    index_batches: List[List[int]] = []
+    for batch in batches:
+        index_batches.append(pending_indices[idx_offset : idx_offset + len(batch)])
+        idx_offset += len(batch)
+
+    click.echo(f"Processing {len(batches)} batches (parallel={parallel})", err=True)
+    failed = 0
+    if parallel == 1:
+        for i, (batch, indices) in enumerate(zip(batches, index_batches)):
+            try:
+                _process_batch(
+                    model_obj, prompt, target_column, batch, few_shot_examples, multiple,
+                    verbose,
+                )
+            except Exception as exc:
+                failed += 1
+                _append_error(err_path, {"row_indices": indices, "error": str(exc)})
+                click.echo(f"  Batch {i + 1}/{len(batches)} failed: {exc}", err=True)
+                continue
+            click.echo(f"  Completed batch {i + 1}/{len(batches)}", err=True)
+    else:
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(
+                    _process_batch,
+                    model_obj,
+                    prompt,
+                    target_column,
+                    batch,
+                    few_shot_examples,
+                    multiple,
+                    verbose,
+                ): (i, indices)
+                for i, (batch, indices) in enumerate(zip(batches, index_batches))
+            }
+            completed = 0
+            for future in as_completed(futures):
+                batch_idx, indices = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    failed += 1
+                    _append_error(err_path, {"row_indices": indices, "error": str(exc)})
+                    click.echo(
+                        f"  Batch {batch_idx + 1}/{len(batches)} failed: {exc}",
+                        err=True,
+                    )
+                    continue
+                completed += 1
+                click.echo(f"  Completed batch {completed}/{len(batches)}", err=True)
+    return failed
+
+
+def _map_repair(
+    context: PluginContext,
+    output_path: Path,
+    err_path: Path,
+    prompt: str,
+    target_column: str,
+    batch_size: int,
+    max_chars: int,
+    few_shot: int,
+    model: Optional[str],
+    multiple: bool,
+    parallel: int,
+) -> None:
+    error_records = _read_errors(err_path)
+    if not error_records:
+        click.echo("No errors to repair; nothing to do", err=True)
+        return
+
+    if not output_path.exists():
+        raise click.ClickException(
+            f"Output file {output_path} does not exist. Run without --repair first."
+        )
+
+    output_input_plugin = context.inputs.for_path(output_path)
+    with output_input_plugin.open(output_path) as stream:
+        rows, fieldnames = _materialize(stream)
+
+    failed_indices = set()
+    for record in error_records:
+        failed_indices.update(record.get("row_indices", []))
+
+    pending = [(i, rows[i]) for i in sorted(failed_indices) if i < len(rows)]
+    if not pending:
+        click.echo("No rows to repair", err=True)
+        _clear_err_file(err_path)
+        return
+
+    processed_indices = {i for i, _ in pending}
+
+    model_obj = resolve_model(model)
+    _require_schema_support(model_obj)
+
+    few_shot_examples = _extract_few_shot_examples(rows, target_column, few_shot)
+    _clear_err_file(err_path)
+    click.echo(f"Repairing {len(pending)} rows", err=True)
+    failed = _run_map_batches(
+        pending,
+        model_obj,
+        prompt,
+        target_column,
+        few_shot_examples,
+        multiple,
+        batch_size,
+        max_chars,
+        parallel,
+        err_path,
+    )
+    if failed:
+        click.echo(f"Warning: {failed} batches still failing; see {err_path}", err=True)
+
+    if multiple:
+        rows = _expand_multiple_rows(rows, target_column, processed_indices)
+
+    output_plugin = context.outputs.for_path(output_path)
+    output_plugin.write(output_path, rows, fieldnames)
+    click.echo(f"Wrote {len(rows)} rows to {output_path}", err=True)
+
+
 def _build_map_prompt(
     prompt: str,
     target_column: str,
     rows: Sequence[Dict[str, Any]],
     few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
+    multiple: bool = False,
 ) -> str:
     lines = [
         "You are assisting with spreadsheet transformations.",
-        "Return valid JSON with no additional commentary.",
     ]
     if few_shot_examples:
         lines.append("Here are example inputs and desired outputs:")
@@ -416,23 +1615,70 @@ def _build_map_prompt(
             lines.append(
                 json.dumps({"input": example_row, "output": value}, ensure_ascii=False)
             )
-    lines.append("User instruction:")
-    lines.append(prompt)
-    lines.append("Rows to process (JSON objects):")
-    for row in rows:
+    lines.append("<spreadsheet_rows>")
+    for i, row in enumerate(rows):
+        lines.append(f"<row_{i}>")
         lines.append(json.dumps(row, ensure_ascii=False))
-    if len(rows) == 1:
+        lines.append(f"</row_{i}>")
+    lines.append("</spreadsheet_rows>")
+    lines.append("<user_instruction>")
+    lines.append(prompt)
+    lines.append("</user_instruction>")
+
+    if multiple:
         lines.append(
-            f"Return a JSON string or number representing the value for column '{target_column}'."
+            f"For each row, provide zero or more values for column '{target_column}'. "
+            f"Each value in the list will be used to create a separate output row."
         )
     else:
         lines.append(
-            f"Return a JSON array of length {len(rows)} with the values for column '{target_column}' in order."
+            f"For each row, provide a single value for column '{target_column}' "
+            f"that answers the user_instruction."
         )
+
     return "\n".join(lines)
 
 
-def _parse_map_response(response: str, expected: int) -> List[Any]:
+def _build_map_schema(
+    rows: Sequence[Dict[str, Any]],
+    target_column: str,
+    multiple: bool = False,
+) -> Dict[str, Any]:
+    properties = {}
+    required = []
+
+    if multiple:
+        column_schema: Dict[str, Any] = {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+    else:
+        column_schema = {
+            "type": "string",
+        }
+
+    for i in range(len(rows)):
+        row_key = f"row_{i}"
+        required.append(row_key)
+        properties[row_key] = {
+            "type": "object",
+            "properties": {target_column: column_schema},
+            "required": [target_column],
+            "additionalProperties": False,
+            "title": f"Row {i}",
+        }
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "title": "MapResponse",
+    }
+
+
+def _parse_map_response(
+    response: str, target_column: str, expected: int, multiple: bool = False
+) -> List[Any]:
     response = response.strip()
     if not response:
         raise click.ClickException("Model returned an empty response")
@@ -440,13 +1686,167 @@ def _parse_map_response(response: str, expected: int) -> List[Any]:
         data = json.loads(response)
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"Response was not valid JSON: {response}") from exc
-    if expected == 1:
-        return [data]
-    if not isinstance(data, list) or len(data) != expected:
+
+    if not isinstance(data, dict):
         raise click.ClickException(
-            f"Expected a JSON array of {expected} items, got: {response}"
+            f"Expected a JSON object with row properties, got: {response}"
         )
-    return data
+
+    values = []
+    for i in range(expected):
+        row_key = f"row_{i}"
+        if row_key not in data:
+            raise click.ClickException(
+                f"Missing expected property '{row_key}' in response"
+            )
+        row_data = data[row_key]
+
+        if not isinstance(row_data, dict):
+            raise click.ClickException(
+                f"Expected '{row_key}' to be an object, got: {row_data}"
+            )
+
+        if target_column not in row_data:
+            raise click.ClickException(
+                f"Missing expected column '{target_column}' in '{row_key}'"
+            )
+
+        value = row_data[target_column]
+        values.append(value)
+
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Reduce prompt/schema/response
+# ---------------------------------------------------------------------------
+
+
+def _reduce_rows(
+    model_obj,
+    prompt: str,
+    rows: Sequence[Dict[str, Any]],
+    group_by: Sequence[str],
+    max_chars: int,
+    result_column: str,
+    verbose: bool = False,
+) -> Any:
+    rendered = json.dumps(list(rows), ensure_ascii=False)
+    is_combine = not (len(rendered) <= max_chars or len(rows) == 1)
+
+    if is_combine:
+        midpoint = max(1, len(rows) // 2)
+        first = _reduce_rows(
+            model_obj, prompt, rows[:midpoint], group_by, max_chars, result_column,
+            verbose,
+        )
+        second = _reduce_rows(
+            model_obj, prompt, rows[midpoint:], group_by, max_chars, result_column,
+            verbose,
+        )
+        prompt_rows = [first, second]
+    else:
+        prompt_rows = rows
+
+    prompt_text = _build_reduce_prompt(
+        prompt, prompt_rows, group_by, result_column, is_combine=is_combine
+    )
+    schema = _build_reduce_schema(result_column, prompt, is_combine)
+    if verbose:
+        _echo_verbose(prompt_text)
+    response = model_obj.prompt(prompt_text, schema=schema)
+    return _parse_reduce_response(response.text(), result_column)
+
+
+def _build_reduce_schema(
+    result_column: str, prompt: str, is_combine: bool = False
+) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            result_column: {
+                "type": "string",
+                "description": f"Answer to '{prompt}' {'based on combining previous summaries' if is_combine else ''}.",
+            }
+        },
+        "required": [result_column],
+        "additionalProperties": False,
+        "title": "ReduceResponse",
+    }
+
+
+def _build_reduce_prompt(
+    prompt: str,
+    rows: Sequence[Dict[str, Any]],
+    group_by: Sequence[str],
+    result_column: str,
+    is_combine: bool = False,
+) -> str:
+    if is_combine:
+        lines = [
+            "You previously produced partial summaries of a group of rows in a spreadsheet."
+        ]
+    else:
+        lines = ["You are summarizing a group of spreadsheet rows."]
+    if group_by and rows:
+        descriptor = [
+            f"'{col}'='{rows[0].get(col)}'" for col in group_by if col in rows[0]
+        ]
+        if descriptor:
+            lines.append(f"They have in common that {', '.join(descriptor)}")
+    lines.append(f"The summary will be stored as '{result_column}'.")
+    if is_combine:
+        lines.append("Previous groups of rows have been combined into these summaries:")
+        lines.append("<summaries>")
+        for i, row in enumerate(rows):
+            lines.append(f"<summary_{i}>")
+            lines.append(json.dumps(row, ensure_ascii=False))
+            lines.append(f"</summary_{i}>")
+        lines.append("</summaries>")
+        lines.append(
+            "Combine the summaries in a way that answers the user's instruction:"
+        )
+    else:
+        lines.append("<rows>")
+        for i, row in enumerate(rows):
+            lines.append(f"<row_{i}>")
+            lines.append(json.dumps(row, ensure_ascii=False))
+            lines.append(f"</row_{i}>")
+        lines.append("</rows>")
+        lines.append("Summarize the rows in a way that answers the user's instruction:")
+    lines.append("<user_instruction>")
+    lines.append(prompt)
+    lines.append("</user_instruction>")
+    return "\n".join(lines)
+
+
+def _parse_reduce_response(response: str, result_column: str) -> Any:
+    response = response.strip()
+    if not response:
+        raise click.ClickException("Model returned an empty response")
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"Reduction response was not valid JSON: {response}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise click.ClickException(
+            f"Expected a JSON object with '{result_column}' property, got: {response}"
+        )
+
+    if result_column not in data:
+        raise click.ClickException(
+            f"Missing expected column '{result_column}' in response"
+        )
+
+    return data[result_column]
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
 
 def _group_rows(
@@ -460,74 +1860,14 @@ def _group_rows(
     return groups
 
 
-def _reduce_rows(
-    model_obj,
-    prompt: str,
-    rows: Sequence[Dict[str, Any]],
-    group_by: Sequence[str],
-    max_chars: int,
-) -> Any:
-    rendered = json.dumps(list(rows), ensure_ascii=False)
-    if len(rendered) <= max_chars or len(rows) == 1:
-        response = model_obj.prompt(
-            _build_reduce_prompt(prompt, rows, group_by)
-        )
-        return _parse_reduce_response(str(response))
-    else:
-        midpoint = max(1, len(rows) // 2)
-        first = _reduce_rows(model_obj, prompt, rows[:midpoint], group_by, max_chars)
-        second = _reduce_rows(model_obj, prompt, rows[midpoint:], group_by, max_chars)
-        response = model_obj.prompt(
-            _build_combine_prompt(prompt, [first, second])
-        )
-        return _parse_reduce_response(str(response))
-
-
-def _build_reduce_prompt(
-    prompt: str,
-    rows: Sequence[Dict[str, Any]],
-    group_by: Sequence[str],
-) -> str:
-    lines = [
-        "You are reducing a group of spreadsheet rows.",
-        "Return a JSON string or number with no extra commentary.",
-    ]
-    if group_by and rows:
-        descriptor = {col: rows[0].get(col) for col in group_by if col in rows[0]}
-        lines.append("Group descriptor:")
-        lines.append(json.dumps(descriptor, ensure_ascii=False))
-    lines.append("Rows (JSON list):")
-    lines.append(json.dumps(list(rows), ensure_ascii=False))
-    lines.append("Reduction instruction:")
-    lines.append(prompt)
-    return "\n".join(lines)
-
-
-def _build_combine_prompt(prompt: str, partial_results: Sequence[Any]) -> str:
-    lines = [
-        "You previously produced partial reductions for a spreadsheet prompt.",
-        "Combine them into a single final result.",
-        "Return a JSON string or number with no commentary.",
-        "Original prompt:",
-        prompt,
-        "Partial results (JSON array):",
-        json.dumps(list(partial_results), ensure_ascii=False),
-    ]
-    return "\n".join(lines)
-
-
-def _parse_reduce_response(response: str) -> Any:
-    response = response.strip()
-    if not response:
-        raise click.ClickException("Model returned an empty response")
-    try:
-        return json.loads(response)
-    except json.JSONDecodeError as exc:
-        raise click.ClickException(f"Reduction response was not valid JSON: {response}") from exc
-
-
-def _materialize(stream: TableStream) -> Tuple[List[Dict[str, Any]], List[str]]:
-    rows = [dict(row) for row in stream.rows]
+def _materialize(
+    stream: TableStream, limit: Optional[int] = None
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    rows: List[Dict[str, Any]] = []
+    for row in stream.rows:
+        rows.append(dict(row))
+        if limit is not None and len(rows) >= limit:
+            break
     fieldnames = _merge_fieldnames(stream.fieldnames, rows)
     return rows, fieldnames
 
@@ -548,3 +1888,189 @@ def _merge_fieldnames(
                 merged.append(name)
                 seen.add(name)
     return merged
+
+
+def _expand_multiple_rows(
+    rows: List[Dict[str, Any]],
+    target_column: str,
+    processed_indices: Set[int],
+) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        value = row.get(target_column)
+        if (
+            i in processed_indices
+            and not isinstance(value, str)
+            and isinstance(value, Iterable)
+        ):
+            for item in value:
+                new_row = row.copy()
+                new_row[target_column] = item
+                expanded.append(new_row)
+        else:
+            expanded.append(row)
+    return expanded
+
+
+# ---------------------------------------------------------------------------
+# Streaming helpers for expression mode
+# ---------------------------------------------------------------------------
+
+
+def _stream_map_expression(
+    stream: TableStream,
+    deterministic: DeterministicExpression,
+    target_column: str,
+    parsed_filters: List[FilterCondition],
+    limit: Optional[int],
+    multiple: bool,
+    output_plugin,
+    dest,
+    fieldnames: List[str],
+) -> Tuple[int, int]:
+    """Process expression-mode map without full materialization.
+
+    Reads rows from the stream one at a time, evaluates the expression,
+    and writes results immediately.  Returns (total_rows_read, rows_written).
+    """
+    total = 0
+    written = 0
+
+    def _generate():
+        nonlocal total, written
+        for raw_row in stream.rows:
+            if limit is not None and total >= limit:
+                break
+            row = dict(raw_row)
+            total += 1
+            should_process = not parsed_filters or all(
+                f.matches(row) for f in parsed_filters
+            )
+            processed = False
+            if should_process and not _has_value(row.get(target_column)):
+                try:
+                    row[target_column] = deterministic.evaluate(row)
+                    processed = True
+                except Exception as exc:
+                    raise click.ClickException(f"Expression failed: {exc}")
+
+            if multiple and processed:
+                value = row.get(target_column)
+                if not isinstance(value, str) and isinstance(value, Iterable):
+                    for item in value:
+                        new_row = row.copy()
+                        new_row[target_column] = item
+                        written += 1
+                        yield new_row
+                    continue
+
+            written += 1
+            yield row
+
+    output_plugin.write(dest, _generate(), fieldnames)
+    return total, written
+
+
+def _stream_filter_expression(
+    stream: TableStream,
+    deterministic: DeterministicExpression,
+    parsed_filters: List[FilterCondition],
+    limit: Optional[int],
+    output_plugin,
+    dest,
+    fieldnames: List[str],
+) -> Tuple[int, int]:
+    """Process expression-mode filter without full materialization.
+
+    Reads rows from the stream, evaluates the predicate, and writes
+    matching rows immediately.  Returns (candidates, kept_count) where
+    candidates is the number of rows that passed --where pre-filters.
+    """
+    total_read = 0
+    candidates = 0
+    kept = 0
+
+    def _generate():
+        nonlocal total_read, candidates, kept
+        for raw_row in stream.rows:
+            if limit is not None and total_read >= limit:
+                break
+            row = dict(raw_row)
+            total_read += 1
+            if parsed_filters and not all(
+                f.matches(row) for f in parsed_filters
+            ):
+                continue
+            candidates += 1
+            if deterministic.evaluate(row):
+                kept += 1
+                yield row
+
+    output_plugin.write(dest, _generate(), fieldnames)
+    return candidates, kept
+
+
+# ---------------------------------------------------------------------------
+# Dry-run & verbose helpers
+# ---------------------------------------------------------------------------
+
+
+def _echo_verbose(prompt_text: str) -> None:
+    click.echo("--- prompt ---", err=True)
+    click.echo(prompt_text, err=True)
+    click.echo("--- end prompt ---", err=True)
+
+
+def _echo_log_tip(n_calls: int) -> None:
+    click.echo(f"Made {n_calls} LLM calls; run 'llm logs -n {n_calls}' to review", err=True)
+
+
+def _echo_dry_run(prompt_text: str, schema: Dict[str, Any], total: int, unit: str) -> None:
+    click.echo("--- DRY RUN: sample prompt (1st batch) ---", err=True)
+    click.echo(prompt_text, err=True)
+    click.echo("--- schema ---", err=True)
+    click.echo(json.dumps(schema, indent=2), err=True)
+    click.echo(f"--- Would process {total} {unit} ---", err=True)
+
+
+def _dry_run_map(
+    pending: List[Tuple[int, Dict[str, Any]]],
+    prompt: str,
+    target_column: str,
+    few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
+    multiple: bool,
+    batch_size: int,
+    max_chars: int,
+) -> None:
+    pending_rows = [row for _, row in pending]
+    batches = _prepare_batches(pending_rows, batch_size, max_chars)
+    sample = batches[0]
+    prompt_text = _build_map_prompt(prompt, target_column, sample, few_shot_examples, multiple)
+    schema = _build_map_schema(sample, target_column, multiple)
+    _echo_dry_run(prompt_text, schema, len(batches), "batches")
+
+
+def _dry_run_reduce(
+    group_items: List[Tuple[str, List[Dict[str, Any]]]],
+    prompt: str,
+    group_by: Sequence[str],
+    max_chars: int,
+    result_column: str,
+) -> None:
+    group_key, group_rows = group_items[0]
+    prompt_text = _build_reduce_prompt(prompt, group_rows, group_by, result_column)
+    schema = _build_reduce_schema(result_column, prompt)
+    _echo_dry_run(prompt_text, schema, len(group_items), "groups")
+
+
+def _dry_run_filter(
+    rows: List[Dict[str, Any]],
+    instruction: str,
+    batch_size: int,
+    max_chars: int,
+) -> None:
+    batches = _prepare_batches(rows, batch_size, max_chars)
+    sample = batches[0]
+    prompt_text = _build_filter_prompt(instruction, sample)
+    schema = _build_filter_schema(sample)
+    _echo_dry_run(prompt_text, schema, len(batches), "batches")
