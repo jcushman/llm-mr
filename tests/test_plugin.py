@@ -1885,7 +1885,12 @@ def test_non_streamable_input_temp_file_fallback(monkeypatch):
     from contextlib import contextmanager
 
     from llm_mr.processors import _open_input
-    from llm_mr.registries import InputRegistry, OutputRegistry, PluginContext, TableStream
+    from llm_mr.registries import (
+        InputRegistry,
+        OutputRegistry,
+        PluginContext,
+        TableStream,
+    )
 
     class PathOnlyInput:
         name = "pathonly"
