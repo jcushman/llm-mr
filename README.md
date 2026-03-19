@@ -655,6 +655,7 @@ just test       # run tests
 just lint       # check linting and formatting
 just fix        # auto-fix linting and formatting
 just check      # lint + test
+just release    # check, tag v{version}, push branch + tag (see docs/release.md)
 ```
 
 Release notes live in
