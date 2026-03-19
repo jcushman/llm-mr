@@ -13,6 +13,12 @@ entry-point group and use :data:`mr_hookimpl` to mark their implementations::
     @mr_hookimpl
     def register_mr_inputs(register):
         register(ParquetInputPlugin())
+
+Plugin classes must satisfy the ``InputPlugin`` / ``OutputPlugin`` protocols
+(``open(path)`` and ``write(path, ...)``).  For stdin/stdout streaming support,
+also implement ``StreamableInput`` (``open_stream(stream)``) and/or
+``StreamableOutput`` (``write_stream(stream, ...)``).  The harness falls back
+to a temp file for plugins that don't support streaming.
 """
 
 from __future__ import annotations

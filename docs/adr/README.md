@@ -1,4 +1,5 @@
 # Architecture Decision Records
+
 Create new ADRs with `just adr <title>`, then edit created file.
 
 * 2026-03-13: [Three Execution Modes](2026-03-13-three_execution_modes.md)
@@ -10,4 +11,3 @@ Create new ADRs with `just adr <title>`, then edit created file.
 * 2026-03-13: [Expression Sandbox](2026-03-13-expression_sandbox.md)
 * 2026-03-13: [Format Detection and Piping](2026-03-13-format_detection_and_piping.md)
 * 2026-03-13: [Packaging and Dependencies](2026-03-13-packaging_and_dependencies.md)
-*

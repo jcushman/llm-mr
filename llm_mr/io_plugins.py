@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import csv
-import io
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterable, Iterator, Sequence, Union
+from typing import IO, Iterable, Iterator, Sequence
 
 from openpyxl import Workbook, load_workbook
 
@@ -17,12 +16,13 @@ class CSVInputPlugin:
     extensions = [".csv"]
 
     @contextmanager
-    def open(self, source: Union[Path, IO[str]]) -> Iterator[TableStream]:
-        if isinstance(source, Path):
-            with source.open("r", encoding="utf-8", newline="") as fp:
-                yield self._read(fp)
-        else:
-            yield self._read(source)
+    def open(self, path: Path) -> Iterator[TableStream]:
+        with path.open("r", encoding="utf-8", newline="") as fp:
+            yield self._read(fp)
+
+    @contextmanager
+    def open_stream(self, stream: IO[str]) -> Iterator[TableStream]:
+        yield self._read(stream)
 
     @staticmethod
     def _read(fp: IO[str]) -> TableStream:
@@ -35,15 +35,15 @@ class CSVOutputPlugin:
     name = "csv"
     extensions = [".csv"]
 
-    def write(
-        self, dest: Union[Path, IO[str]], rows: Iterable[Row], fieldnames: Iterable[str]
-    ) -> None:
+    def write(self, path: Path, rows: Iterable[Row], fieldnames: Iterable[str]) -> None:
         field_list = list(fieldnames)
-        if isinstance(dest, Path):
-            with dest.open("w", encoding="utf-8", newline="") as fp:
-                self._write_fp(fp, rows, field_list)
-        else:
-            self._write_fp(dest, rows, field_list)
+        with path.open("w", encoding="utf-8", newline="") as fp:
+            self._write_fp(fp, rows, field_list)
+
+    def write_stream(
+        self, stream: IO[str], rows: Iterable[Row], fieldnames: Iterable[str]
+    ) -> None:
+        self._write_fp(stream, rows, list(fieldnames))
 
     @staticmethod
     def _write_fp(fp: IO[str], rows: Iterable[Row], field_list: list) -> None:
@@ -59,12 +59,13 @@ class JSONLInputPlugin:
     extensions = [".jsonl"]
 
     @contextmanager
-    def open(self, source: Union[Path, IO[str]]) -> Iterator[TableStream]:
-        if isinstance(source, Path):
-            with source.open("r", encoding="utf-8") as fp:
-                yield self._read(fp)
-        else:
-            yield self._read(source)
+    def open(self, path: Path) -> Iterator[TableStream]:
+        with path.open("r", encoding="utf-8") as fp:
+            yield self._read(fp)
+
+    @contextmanager
+    def open_stream(self, stream: IO[str]) -> Iterator[TableStream]:
+        yield self._read(stream)
 
     @staticmethod
     def _read(fp: IO[str]) -> TableStream:
@@ -93,14 +94,14 @@ class JSONLOutputPlugin:
     name = "jsonl"
     extensions = [".jsonl"]
 
-    def write(
-        self, dest: Union[Path, IO[str]], rows: Iterable[Row], fieldnames: Sequence[str]
+    def write(self, path: Path, rows: Iterable[Row], fieldnames: Sequence[str]) -> None:
+        with path.open("w", encoding="utf-8") as fp:
+            self._write_fp(fp, rows)
+
+    def write_stream(
+        self, stream: IO[str], rows: Iterable[Row], fieldnames: Sequence[str]
     ) -> None:
-        if isinstance(dest, Path):
-            with dest.open("w", encoding="utf-8") as fp:
-                self._write_fp(fp, rows)
-        else:
-            self._write_fp(dest, rows)
+        self._write_fp(stream, rows)
 
     @staticmethod
     def _write_fp(fp: IO[str], rows: Iterable[Row]) -> None:

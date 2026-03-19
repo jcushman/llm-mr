@@ -1,17 +1,37 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import click
 import llm
 from llm.cli import get_default_model
 
-from .registries import PluginContext, TableStream, normalize_extension
+from .registries import (
+    PluginContext,
+    StreamableInput,
+    StreamableOutput,
+    TableStream,
+    normalize_extension,
+)
 
 
 @dataclass
@@ -179,30 +199,88 @@ def _resolve_formats(
     return in_fmt, out_fmt
 
 
+WriteFn = Callable[[Iterable, Sequence[str]], None]
+
+
+@contextmanager
 def _open_input(context: PluginContext, input_path: Optional[Path], in_fmt: str):
-    """Return (plugin, source) for the resolved input."""
+    """Open the resolved input and yield a TableStream.
+
+    For file paths, delegates to ``plugin.open(path)``.  For piped stdin,
+    uses ``plugin.open_stream(stdin)`` when available (StreamableInput) or
+    spools stdin to a temp file as a fallback.
+    """
     if input_path is not None:
         plugin = context.inputs.for_path(input_path)
-        return plugin, input_path
-    plugin = context.inputs.for_name(in_fmt)
-    return plugin, sys.stdin
+        with plugin.open(input_path) as stream:
+            yield stream
+    else:
+        plugin = context.inputs.for_name(in_fmt)
+        if isinstance(plugin, StreamableInput):
+            with plugin.open_stream(sys.stdin) as stream:
+                yield stream
+        else:
+            with _spooled_stdin() as tmp_path:
+                with plugin.open(tmp_path) as stream:
+                    yield stream
 
 
-def _resolve_output(context: PluginContext, output_path: Optional[Path], out_fmt: str):
-    """Return (plugin, dest) for the resolved output."""
+@contextmanager
+def _spooled_stdin():
+    """Spool stdin to a temp file for plugins that require a Path."""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".tmp", delete=False, encoding="utf-8"
+    )
+    try:
+        shutil.copyfileobj(sys.stdin, tmp)
+        tmp.close()
+        yield Path(tmp.name)
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def _output_writer(
+    context: PluginContext, output_path: Optional[Path], out_fmt: str
+) -> WriteFn:
+    """Return a ``(rows, fieldnames) -> None`` callable for the resolved output.
+
+    For file paths, delegates to ``plugin.write(path, ...)``.  For piped
+    stdout, uses ``plugin.write_stream(stdout, ...)`` when available
+    (StreamableOutput) or writes to a temp file and copies as a fallback.
+    """
     if output_path is not None:
         plugin = context.outputs.for_path(output_path)
-        return plugin, output_path
+
+        def write(rows: Iterable, fieldnames: Sequence[str]) -> None:
+            plugin.write(output_path, rows, fieldnames)
+
+        return write
+
     plugin = context.outputs.for_name(out_fmt)
-    return plugin, sys.stdout
+    if isinstance(plugin, StreamableOutput):
+
+        def write(rows: Iterable, fieldnames: Sequence[str]) -> None:
+            plugin.write_stream(sys.stdout, rows, fieldnames)
+
+        return write
+
+    def write(rows: Iterable, fieldnames: Sequence[str]) -> None:
+        tmp = tempfile.NamedTemporaryFile(suffix="." + out_fmt, delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        try:
+            plugin.write(tmp_path, rows, fieldnames)
+            sys.stdout.buffer.write(tmp_path.read_bytes())
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    return write
 
 
 def _stdin_guard(input_path: Optional[Path]) -> None:
     """Error if reading from stdin but stdin is a TTY (nothing piped)."""
     if input_path is None and sys.stdin.isatty():
-        raise click.UsageError(
-            "Provide -i <file> or pipe data to stdin."
-        )
+        raise click.UsageError("Provide -i <file> or pipe data to stdin.")
 
 
 def _interactive_stdin_guard(mode: str, input_path: Optional[Path]) -> None:
@@ -337,9 +415,7 @@ class MapProcessor:
 
             if repair:
                 if err_path is None:
-                    raise click.UsageError(
-                        "--repair requires --output or --err"
-                    )
+                    raise click.UsageError("--repair requires --output or --err")
                 if output_path is None:
                     raise click.UsageError(
                         "--repair requires --output to merge results"
@@ -364,15 +440,20 @@ class MapProcessor:
             # Streaming path: expression mode avoids full materialization
             if mode == "expression" and not in_place:
                 deterministic = _compile_expression(instruction)
-                input_plugin, source = _open_input(context, input_path, in_fmt)
-                output_plugin, dest = _resolve_output(context, output_path, out_fmt)
-                with input_plugin.open(source) as stream:
+                write_output = _output_writer(context, output_path, out_fmt)
+                with _open_input(context, input_path, in_fmt) as stream:
                     fieldnames = list(stream.fieldnames or [])
                     if target_column not in fieldnames:
                         fieldnames.append(target_column)
                     total, written = _stream_map_expression(
-                        stream, deterministic, target_column, parsed_filters,
-                        limit, multiple, output_plugin, dest, fieldnames,
+                        stream,
+                        deterministic,
+                        target_column,
+                        parsed_filters,
+                        limit,
+                        multiple,
+                        write_output,
+                        fieldnames,
                     )
                 click.echo(
                     f"Wrote {written} rows"
@@ -381,8 +462,7 @@ class MapProcessor:
                 )
                 return
 
-            input_plugin, source = _open_input(context, input_path, in_fmt)
-            with input_plugin.open(source) as stream:
+            with _open_input(context, input_path, in_fmt) as stream:
                 rows, fieldnames = _materialize(stream, limit=limit)
 
             target_rows = filter_rows(rows, parsed_filters)
@@ -436,7 +516,9 @@ class MapProcessor:
                 ]
                 processed_indices = {i for i, _ in pending}
                 if not pending:
-                    click.echo("No rows required LLM processing; nothing to do", err=True)
+                    click.echo(
+                        "No rows required LLM processing; nothing to do", err=True
+                    )
                 else:
                     if dry_run:
                         _dry_run_map(
@@ -466,18 +548,24 @@ class MapProcessor:
                     if failed:
                         click.echo(
                             f"Warning: {failed} batches failed"
-                            + (f"; see {err_path} — rerun with --repair"
-                               if err_path else "")
-                            ,
+                            + (
+                                f"; see {err_path} — rerun with --repair"
+                                if err_path
+                                else ""
+                            ),
                             err=True,
                         )
 
             if multiple:
                 rows = _expand_multiple_rows(rows, target_column, processed_indices)
 
-            output_plugin, dest = _resolve_output(context, output_path, out_fmt)
-            output_plugin.write(dest, rows, fieldnames)
-            click.echo(f"Wrote {len(rows)} rows" + (f" to {output_path}" if output_path else ""), err=True)
+            write_output = _output_writer(context, output_path, out_fmt)
+            write_output(rows, fieldnames)
+            click.echo(
+                f"Wrote {len(rows)} rows"
+                + (f" to {output_path}" if output_path else ""),
+                err=True,
+            )
             if not deterministic and pending:
                 pending_rows = [row for _, row in pending]
                 n_batches = len(_prepare_batches(pending_rows, batch_size, max_chars))
@@ -516,6 +604,13 @@ class ReduceProcessor:
             default="mr_result",
             show_default=True,
             help="Column name for reduced value",
+        )
+        @click.option(
+            "--group-key-column",
+            "group_key_column",
+            default="group",
+            show_default=True,
+            help="Column name for the group key in reduced output",
         )
         @click.option(
             "--max-chars",
@@ -558,6 +653,7 @@ class ReduceProcessor:
             group_by: Sequence[str],
             output: Optional[Path],
             result_column: str,
+            group_key_column: str,
             max_chars: int,
             parallel: int,
             repair: bool,
@@ -569,13 +665,17 @@ class ReduceProcessor:
             _stdin_guard(input_path)
             _interactive_stdin_guard(mode, input_path)
 
+            if group_key_column == result_column:
+                raise click.ClickException(
+                    "--group-key-column and --column must differ (both would name the same output column)"
+                )
+
             in_fmt, out_fmt = _resolve_formats(
                 input_path, output, format_, input_format, output_format
             )
             err_path = err_file if err_file is not None else _err_path_for(output)
 
-            input_plugin, source = _open_input(context, input_path, in_fmt)
-            with input_plugin.open(source) as stream:
+            with _open_input(context, input_path, in_fmt) as stream:
                 rows, fieldnames = _materialize(stream)
 
             for col in group_by:
@@ -594,9 +694,7 @@ class ReduceProcessor:
 
             if repair:
                 if err_path is None:
-                    raise click.UsageError(
-                        "--repair requires --output or --err"
-                    )
+                    raise click.UsageError("--repair requires --output or --err")
                 if output is None:
                     raise click.UsageError(
                         "--repair requires --output to merge results"
@@ -609,6 +707,7 @@ class ReduceProcessor:
                     instruction,
                     group_by,
                     result_column,
+                    group_key_column,
                     worker_model or model,
                     max_chars,
                     parallel,
@@ -645,7 +744,7 @@ class ReduceProcessor:
                         raise click.ClickException(
                             f"Expression failed on group '{group_key}': {exc}"
                         )
-                    results.append({"group": group_key, result_column: value})
+                    results.append({group_key_column: group_key, result_column: value})
                 click.echo(f"Reduced {len(results)} groups deterministically", err=True)
             else:
                 worker = _resolve_worker_model(model, worker_model)
@@ -663,7 +762,10 @@ class ReduceProcessor:
                     )
                     return
 
-                click.echo(f"Reducing {len(group_items)} groups (parallel={parallel})", err=True)
+                click.echo(
+                    f"Reducing {len(group_items)} groups (parallel={parallel})",
+                    err=True,
+                )
                 _clear_err_file(err_path)
                 results, failed = _run_reduce_groups(
                     group_items,
@@ -672,6 +774,7 @@ class ReduceProcessor:
                     group_by,
                     max_chars,
                     result_column,
+                    group_key_column,
                     parallel,
                     err_path,
                     verbose,
@@ -679,13 +782,16 @@ class ReduceProcessor:
                 if failed:
                     click.echo(
                         f"Warning: {failed}/{len(group_items)} groups failed"
-                        + (f"; see {err_path} — rerun with --repair"
-                           if err_path else ""),
+                        + (
+                            f"; see {err_path} — rerun with --repair"
+                            if err_path
+                            else ""
+                        ),
                         err=True,
                     )
 
-            output_plugin, dest = _resolve_output(context, output, out_fmt)
-            output_plugin.write(dest, results, ["group", result_column])
+            write_output = _output_writer(context, output, out_fmt)
+            write_output(results, [group_key_column, result_column])
             click.echo(
                 f"Wrote {len(results)} group results"
                 + (f" to {output}" if output else ""),
@@ -768,13 +874,16 @@ class FilterProcessor:
             # Streaming path: expression mode avoids full materialization
             if mode == "expression":
                 deterministic = _compile_expression(instruction)
-                input_plugin, source = _open_input(context, input_path, in_fmt)
-                output_plugin, dest = _resolve_output(context, output, out_fmt)
-                with input_plugin.open(source) as stream:
+                write_output = _output_writer(context, output, out_fmt)
+                with _open_input(context, input_path, in_fmt) as stream:
                     fieldnames = list(stream.fieldnames or [])
                     candidates, kept_count = _stream_filter_expression(
-                        stream, deterministic, parsed_filters,
-                        limit, output_plugin, dest, fieldnames,
+                        stream,
+                        deterministic,
+                        parsed_filters,
+                        limit,
+                        write_output,
+                        fieldnames,
                     )
                 click.echo(
                     f"Kept {kept_count}/{candidates} rows"
@@ -783,8 +892,7 @@ class FilterProcessor:
                 )
                 return
 
-            input_plugin, source = _open_input(context, input_path, in_fmt)
-            with input_plugin.open(source) as stream:
+            with _open_input(context, input_path, in_fmt) as stream:
                 rows, fieldnames = _materialize(stream, limit=limit)
 
             rows = filter_rows(rows, parsed_filters)
@@ -826,8 +934,8 @@ class FilterProcessor:
                     verbose,
                 )
 
-            output_plugin, dest = _resolve_output(context, output, out_fmt)
-            output_plugin.write(dest, kept, fieldnames)
+            write_output = _output_writer(context, output, out_fmt)
+            write_output(kept, fieldnames)
             click.echo(
                 f"Kept {len(kept)}/{len(rows)} rows"
                 + (f" → {output}" if output else ""),
@@ -1208,6 +1316,7 @@ def _run_reduce_groups(
     group_by: Sequence[str],
     max_chars: int,
     result_column: str,
+    group_key_column: str,
     parallel: int,
     err_path: Path,
     verbose: bool = False,
@@ -1216,7 +1325,7 @@ def _run_reduce_groups(
         value = _reduce_rows(
             model_obj, prompt, group_rows, group_by, max_chars, result_column, verbose
         )
-        return {"group": group_key, result_column: value}
+        return {group_key_column: group_key, result_column: value}
 
     results: List[Dict[str, Any]] = []
     failed = 0
@@ -1253,7 +1362,9 @@ def _run_reduce_groups(
                     )
                     continue
                 completed += 1
-                click.echo(f"  Completed group {completed}/{len(group_items)}", err=True)
+                click.echo(
+                    f"  Completed group {completed}/{len(group_items)}", err=True
+                )
 
     return results, failed
 
@@ -1266,6 +1377,7 @@ def _reduce_repair(
     prompt: str,
     group_by: Sequence[str],
     result_column: str,
+    group_key_column: str,
     model: Optional[str],
     max_chars: int,
     parallel: int,
@@ -1297,7 +1409,9 @@ def _reduce_repair(
     _require_schema_support(model_obj)
 
     _clear_err_file(err_path)
-    click.echo(f"Repairing {len(pending_groups)} groups (parallel={parallel})", err=True)
+    click.echo(
+        f"Repairing {len(pending_groups)} groups (parallel={parallel})", err=True
+    )
     new_results, failed = _run_reduce_groups(
         pending_groups,
         model_obj,
@@ -1305,6 +1419,7 @@ def _reduce_repair(
         group_by,
         max_chars,
         result_column,
+        group_key_column,
         parallel,
         err_path,
     )
@@ -1314,7 +1429,7 @@ def _reduce_repair(
 
     merged = existing_results + new_results
     output_plugin = context.outputs.for_path(output)
-    output_plugin.write(output, merged, ["group", result_column])
+    output_plugin.write(output, merged, [group_key_column, result_column])
     click.echo(f"Wrote {len(merged)} group results to {output}", err=True)
 
 
@@ -1489,7 +1604,12 @@ def _run_map_batches(
         for i, (batch, indices) in enumerate(zip(batches, index_batches)):
             try:
                 _process_batch(
-                    model_obj, prompt, target_column, batch, few_shot_examples, multiple,
+                    model_obj,
+                    prompt,
+                    target_column,
+                    batch,
+                    few_shot_examples,
+                    multiple,
                     verbose,
                 )
             except Exception as exc:
@@ -1737,11 +1857,21 @@ def _reduce_rows(
     if is_combine:
         midpoint = max(1, len(rows) // 2)
         first = _reduce_rows(
-            model_obj, prompt, rows[:midpoint], group_by, max_chars, result_column,
+            model_obj,
+            prompt,
+            rows[:midpoint],
+            group_by,
+            max_chars,
+            result_column,
             verbose,
         )
         second = _reduce_rows(
-            model_obj, prompt, rows[midpoint:], group_by, max_chars, result_column,
+            model_obj,
+            prompt,
+            rows[midpoint:],
+            group_by,
+            max_chars,
+            result_column,
             verbose,
         )
         prompt_rows = [first, second]
@@ -1924,8 +2054,7 @@ def _stream_map_expression(
     parsed_filters: List[FilterCondition],
     limit: Optional[int],
     multiple: bool,
-    output_plugin,
-    dest,
+    write_fn: WriteFn,
     fieldnames: List[str],
 ) -> Tuple[int, int]:
     """Process expression-mode map without full materialization.
@@ -1967,7 +2096,7 @@ def _stream_map_expression(
             written += 1
             yield row
 
-    output_plugin.write(dest, _generate(), fieldnames)
+    write_fn(_generate(), fieldnames)
     return total, written
 
 
@@ -1976,8 +2105,7 @@ def _stream_filter_expression(
     deterministic: DeterministicExpression,
     parsed_filters: List[FilterCondition],
     limit: Optional[int],
-    output_plugin,
-    dest,
+    write_fn: WriteFn,
     fieldnames: List[str],
 ) -> Tuple[int, int]:
     """Process expression-mode filter without full materialization.
@@ -1997,16 +2125,14 @@ def _stream_filter_expression(
                 break
             row = dict(raw_row)
             total_read += 1
-            if parsed_filters and not all(
-                f.matches(row) for f in parsed_filters
-            ):
+            if parsed_filters and not all(f.matches(row) for f in parsed_filters):
                 continue
             candidates += 1
             if deterministic.evaluate(row):
                 kept += 1
                 yield row
 
-    output_plugin.write(dest, _generate(), fieldnames)
+    write_fn(_generate(), fieldnames)
     return candidates, kept
 
 
@@ -2022,10 +2148,14 @@ def _echo_verbose(prompt_text: str) -> None:
 
 
 def _echo_log_tip(n_calls: int) -> None:
-    click.echo(f"Made {n_calls} LLM calls; run 'llm logs -n {n_calls}' to review", err=True)
+    click.echo(
+        f"Made {n_calls} LLM calls; run 'llm logs -n {n_calls}' to review", err=True
+    )
 
 
-def _echo_dry_run(prompt_text: str, schema: Dict[str, Any], total: int, unit: str) -> None:
+def _echo_dry_run(
+    prompt_text: str, schema: Dict[str, Any], total: int, unit: str
+) -> None:
     click.echo("--- DRY RUN: sample prompt (1st batch) ---", err=True)
     click.echo(prompt_text, err=True)
     click.echo("--- schema ---", err=True)
@@ -2045,7 +2175,9 @@ def _dry_run_map(
     pending_rows = [row for _, row in pending]
     batches = _prepare_batches(pending_rows, batch_size, max_chars)
     sample = batches[0]
-    prompt_text = _build_map_prompt(prompt, target_column, sample, few_shot_examples, multiple)
+    prompt_text = _build_map_prompt(
+        prompt, target_column, sample, few_shot_examples, multiple
+    )
     schema = _build_map_schema(sample, target_column, multiple)
     _echo_dry_run(prompt_text, schema, len(batches), "batches")
 

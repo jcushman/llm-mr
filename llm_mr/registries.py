@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
+    IO,
     Any,
     ContextManager,
     Dict,
@@ -11,6 +12,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    runtime_checkable,
 )
 
 import click
@@ -37,6 +39,24 @@ class OutputPlugin(Protocol):
 
     def write(
         self, path: Path, rows: Iterable[Row], fieldnames: Sequence[str]
+    ) -> None: ...
+
+
+@runtime_checkable
+class StreamableInput(Protocol):
+    """Optional protocol for input plugins that can read directly from a
+    text stream (e.g. stdin) without requiring a temp-file intermediary."""
+
+    def open_stream(self, stream: IO[str]) -> ContextManager[TableStream]: ...
+
+
+@runtime_checkable
+class StreamableOutput(Protocol):
+    """Optional protocol for output plugins that can write directly to a
+    text stream (e.g. stdout) without requiring a temp-file intermediary."""
+
+    def write_stream(
+        self, stream: IO[str], rows: Iterable[Row], fieldnames: Sequence[str]
     ) -> None: ...
 
 
@@ -68,9 +88,7 @@ class InputRegistry:
     def for_name(self, name: str) -> InputPlugin:
         plugin = self._by_name.get(name)
         if plugin is None:
-            raise click.ClickException(
-                f"No input plugin registered with name '{name}'"
-            )
+            raise click.ClickException(f"No input plugin registered with name '{name}'")
         return plugin
 
     def values(self) -> List[InputPlugin]:

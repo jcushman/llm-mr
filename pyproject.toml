@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 authors = [{ name = "Jack Cushman" }]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
@@ -32,7 +32,9 @@ mr = "llm_mr.plugin"
 
 [project.urls]
 Homepage = "https://github.com/jcushman/llm-mr"
+Repository = "https://github.com/jcushman/llm-mr"
 Issues = "https://github.com/jcushman/llm-mr/issues"
+Changelog = "https://github.com/jcushman/llm-mr/blob/main/CHANGELOG.md"
 
 [tool.uv]
 package = true

@@ -695,6 +695,81 @@ def test_reduce_prompt_mode(tmp_path, mock_model):
         assert "You are summarizing a group of spreadsheet rows." in prompt
 
 
+def test_reduce_group_key_column_option(tmp_path, mock_model):
+    """--group-key-column renames the group key column in reduce output."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    rows = [
+        {"team": "A", "score": "10"},
+        {"team": "A", "score": "12"},
+        {"team": "B", "score": "5"},
+    ]
+    _write_csv(input_path, rows)
+
+    mock_model.queue_response(json.dumps({"summary": "Summary A"}))
+    mock_model.queue_response(json.dumps({"summary": "Summary B"}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize group",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--group-key-column",
+            "team",
+            "-c",
+            "summary",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert written_rows == [
+        {"team": "A", "summary": "Summary A"},
+        {"team": "B", "summary": "Summary B"},
+    ]
+
+
+def test_reduce_rejects_duplicate_key_and_result_column_names(tmp_path):
+    """Reduce fails when --group-key-column matches -c."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    _write_csv(input_path, [{"team": "A", "score": "10"}])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "len(rows)",
+            "-e",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--group-key-column",
+            "x",
+            "-c",
+            "x",
+            "--output",
+            str(output_path),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "--group-key-column and --column must differ" in result.output
+
+
 def test_reduce_expression_mode(tmp_path):
     """Reduce with -e uses a deterministic Python expression over rows."""
     input_path = tmp_path / "input.csv"
@@ -1469,7 +1544,9 @@ def test_pipe_csv_with_format_flag(tmp_path):
         {"id": "1", "name": "alice"},
         {"id": "2", "name": "bob"},
     ]
-    import io, csv as _csv
+    import io
+    import csv as _csv
+
     buf = io.StringIO()
     writer = _csv.DictWriter(buf, fieldnames=["id", "name"])
     writer.writeheader()
@@ -1503,7 +1580,9 @@ def test_format_cascade_file_extension(tmp_path):
     )
     assert result.exit_code == 0, result.stderr
 
-    import io, csv as _csv
+    import io
+    import csv as _csv
+
     reader = _csv.DictReader(io.StringIO(result.stdout))
     output_rows = list(reader)
     assert len(output_rows) == 1
@@ -1773,6 +1852,138 @@ def test_in_place_requires_input_file():
     )
     assert result.exit_code != 0
     assert "--in-place requires -i" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Protocol and external plugin tests
+# ---------------------------------------------------------------------------
+
+
+def test_streamable_protocol_checks():
+    """Builtin plugins satisfy the correct streaming protocols."""
+    from llm_mr.io_plugins import (
+        CSVInputPlugin,
+        CSVOutputPlugin,
+        JSONLInputPlugin,
+        JSONLOutputPlugin,
+        XLSXInputPlugin,
+        XLSXOutputPlugin,
+    )
+    from llm_mr.registries import StreamableInput, StreamableOutput
+
+    assert isinstance(CSVInputPlugin(), StreamableInput)
+    assert isinstance(CSVOutputPlugin(), StreamableOutput)
+    assert isinstance(JSONLInputPlugin(), StreamableInput)
+    assert isinstance(JSONLOutputPlugin(), StreamableOutput)
+    assert not isinstance(XLSXInputPlugin(), StreamableInput)
+    assert not isinstance(XLSXOutputPlugin(), StreamableOutput)
+
+
+def test_non_streamable_input_temp_file_fallback(monkeypatch):
+    """Piping to a Path-only input plugin spools through a temp file."""
+    import io
+    from contextlib import contextmanager
+
+    from llm_mr.processors import _open_input
+    from llm_mr.registries import InputRegistry, OutputRegistry, PluginContext, TableStream
+
+    class PathOnlyInput:
+        name = "pathonly"
+        extensions = [".pathonly"]
+
+        @contextmanager
+        def open(self, path):
+            with path.open("r") as fp:
+                rows = [json.loads(line) for line in fp if line.strip()]
+            fieldnames = list(rows[0].keys()) if rows else []
+            yield TableStream(rows=iter(rows), fieldnames=fieldnames)
+
+    inputs = InputRegistry()
+    inputs.register(PathOnlyInput())
+    context = PluginContext(inputs=inputs, outputs=OutputRegistry())
+
+    fake_stdin = io.StringIO(
+        '{"id": "1", "name": "alice"}\n{"id": "2", "name": "bob"}\n'
+    )
+    monkeypatch.setattr("sys.stdin", fake_stdin)
+
+    with _open_input(context, None, "pathonly") as stream:
+        rows = list(stream.rows)
+
+    assert len(rows) == 2
+    assert rows[0] == {"id": "1", "name": "alice"}
+    assert rows[1] == {"id": "2", "name": "bob"}
+
+
+def test_non_streamable_output_temp_file_fallback(monkeypatch):
+    """Writing to stdout with a Path-only output plugin goes through a temp file."""
+    import io
+
+    from llm_mr.processors import _output_writer
+    from llm_mr.registries import InputRegistry, OutputRegistry, PluginContext
+
+    class PathOnlyOutput:
+        name = "pathonly"
+        extensions = [".pathonly"]
+
+        def write(self, path, rows, fieldnames):
+            with path.open("w", encoding="utf-8") as fp:
+                for row in rows:
+                    fp.write(json.dumps(row) + "\n")
+
+    outputs = OutputRegistry()
+    outputs.register(PathOnlyOutput())
+    context = PluginContext(inputs=InputRegistry(), outputs=outputs)
+
+    fake_buffer = io.BytesIO()
+
+    class FakeStdout:
+        buffer = fake_buffer
+
+    monkeypatch.setattr("sys.stdout", FakeStdout())
+
+    write = _output_writer(context, None, "pathonly")
+    write([{"id": "1"}, {"id": "2"}], ["id"])
+
+    output = fake_buffer.getvalue().decode()
+    rows = [json.loads(line) for line in output.strip().splitlines()]
+    assert len(rows) == 2
+    assert rows[0] == {"id": "1"}
+    assert rows[1] == {"id": "2"}
+
+
+def test_hook_registration():
+    """Third-party plugins register via the hook system."""
+    from contextlib import contextmanager
+
+    from llm_mr.hookspecs import mr_hookimpl, mr_pm
+    from llm_mr.registries import InputRegistry, TableStream
+
+    class FakePlugin:
+        name = "hooktest"
+        extensions = [".hooktest"]
+
+        @contextmanager
+        def open(self, path):
+            yield TableStream(rows=iter(()), fieldnames=[])
+
+    class HookImpl:
+        __name__ = "TestHookImpl"
+
+        @mr_hookimpl
+        def register_mr_inputs(self, register):
+            register(FakePlugin())
+
+    impl = HookImpl()
+    mr_pm.register(impl)
+    try:
+        registry = InputRegistry()
+        mr_pm.hook.register_mr_inputs(register=registry.register)
+        plugin = registry.for_name("hooktest")
+        assert plugin.name == "hooktest"
+        assert plugin.extensions == [".hooktest"]
+    finally:
+        mr_pm.unregister(impl)
 
 
 # ---------------------------------------------------------------------------

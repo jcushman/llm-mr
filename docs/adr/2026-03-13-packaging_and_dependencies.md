@@ -22,7 +22,7 @@ modern Python libraries. Callers use `importlib.metadata` instead.
 
 **openpyxl is a default dependency.** openpyxl is included in the main
 dependency list, not as an optional extra. It is small and pure-Python, and
-users expect Excel support without an extra install step.
+we want Excel support without an extra install step.
 
 **`py.typed` marker.** An empty `llm_mr/py.typed` file is included per
 PEP 561, signaling that the package ships inline type annotations.

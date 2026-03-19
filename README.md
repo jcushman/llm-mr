@@ -73,6 +73,67 @@ pip install llm llm-mr
 Then [configure a model and API key](https://llm.datasette.io/en/stable/setup.html)
 before continuing.
 
+## Writing I/O format plugins
+
+Extra tabular formats (beyond CSV, JSONL, and XLSX) ship as normal Python packages that
+depend on `llm-mr` and register **input** and/or **output** plugins with [pluggy](https://pluggy.readthedocs.io/)
+via the `llm_mr` entry-point group.
+
+Declare the entry point in `pyproject.toml` (the value is an importable module that is
+loaded for side effects; a package `__init__.py` works well):
+
+```toml
+[project.entry-points.llm_mr]
+myformat = "llm_mr_myformat"
+```
+
+In that module, use `mr_hookimpl` from `llm_mr.hookspecs` and implement
+`register_mr_inputs` and/or `register_mr_outputs`. Each receives a `register` callback;
+pass an instance of your plugin class.
+
+Plugins must satisfy the `InputPlugin` and/or `OutputPlugin` protocols in
+`llm_mr.registries`:
+
+- **Input:** `name` (string id, e.g. `"parquet"`), `extensions` (e.g. `[".parquet"]`),
+  and `open(self, path: Path)` as a context manager yielding a `TableStream` (`rows`
+  iterable and optional `fieldnames`).
+- **Output:** same `name` / `extensions`, plus `write(self, path: Path, rows, fieldnames)`
+  that writes the file.
+
+This is all that's required — stdin/stdout piping works automatically via a
+temp-file intermediary. For streaming without a temp file, also implement
+`StreamableInput` (`open_stream(self, stream)`) and/or `StreamableOutput`
+(`write_stream(self, stream, rows, fieldnames)`).
+
+```python
+# llm_mr_myformat/__init__.py
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+from llm_mr.hookspecs import mr_hookimpl
+from llm_mr.registries import TableStream
+
+
+class ParquetInputPlugin:
+    name = "parquet"
+    extensions = [".parquet"]
+
+    @contextmanager
+    def open(self, path: Path) -> Iterator[TableStream]:
+        rows = ...  # load rows as Iterable[Row]
+        yield TableStream(rows=rows, fieldnames=[...])
+
+
+@mr_hookimpl
+def register_mr_inputs(register):
+    register(ParquetInputPlugin())
+```
+
+After installation, `llm mr` discovers plugins through the same entry-point loading as
+the main `llm` tool; users install your package with `pip` / `llm install` like any other
+dependency.
+
 ## Tutorial: Getting Started
 
 ### Step 1: Install
@@ -198,10 +259,15 @@ Like the map step, we could have used the `-p` flag, or no flag for interactive 
 ### Step 5: Reduce
 
 The `reduce` command groups rows by a given column and summarizes each group.
+Output is a small table with two columns: the **group key** and the **reduced
+value**. By default those columns are named `group` and `mr_result`; here we
+rename them to match the grouping column and a clearer summary name using
+`--group-key-column` and `-c` / `--column`.
 
 ```bash
 llm mr reduce "What characteristics do these foods share?" \
-  -p -i foods_classified.csv --group-by tastiness -o food_analysis.csv
+  -p -i foods_classified.csv --group-by tastiness \
+  --group-key-column tastiness -c summary -o food_analysis.csv
 ```
 
 ```csv
@@ -223,6 +289,9 @@ each item into its own output row.
 llm mr map "Come up with more foods matching this description" \
   -p -i food_analysis.csv --column food --multiple -o more_foods.csv
 ```
+
+(Use the `food_analysis.csv` from step 5 so the input columns are `tastiness`
+and `summary`.)
 
 ```csv
 tastiness,summary,food
@@ -342,7 +411,9 @@ llm mr filter '"keyword" in row["text"].lower()' -e -i data.csv -o filtered.csv
 ### Reduce expressions
 
 The expression receives `rows`, a **list** of dicts (all rows in the current
-group). It should return a single aggregate value.
+group). It should return a single aggregate value. Output columns are still
+`group` and `mr_result` by default (or whatever you pass with
+`--group-key-column` / `-c`).
 
 ```bash
 llm mr reduce 'sum(int(r["score"]) for r in rows)' -e -i data.csv --group-by team -o totals.csv
@@ -429,6 +500,12 @@ llm mr filter "about climate" -p -i data.csv --output-format jsonl
 All progress and status messages go to stderr, keeping stdout clean for data.
 This is true whether you use `-o` or pipe to stdout.
 
+### Non-interactive use (`llm` stdin)
+
+When stdin is not a TTY (for example in CI or some automation tools), the
+underlying `llm` CLI may wait for input. If a command seems to hang, redirect
+stdin, e.g. append `</dev/null` to the command.
+
 ## Command Reference
 
 ### Map
@@ -461,10 +538,19 @@ Options:
 
 ### Reduce
 
-Group rows and summarize each group.
+Group rows and summarize each group. Each output row has two fields: the group
+key (default column name `group`) and the reduced value (default `mr_result`).
+Use `--group-key-column` and `-c` to rename them.
 
 ```bash
 llm mr reduce "Summarize performance" -p -i data.csv --group-by department -o summary.csv
+```
+
+With clearer column names:
+
+```bash
+llm mr reduce "Summarize performance" -p -i data.csv --group-by department \
+  --group-key-column department -c summary -o summary.csv
 ```
 
 With `-e`, you can aggregate with plain Python — no LLM needed:
@@ -478,7 +564,8 @@ Options:
 - `-i` / `--input` — input file (omit to read stdin)
 - `-o` / `--output` — output path (omit for stdout)
 - `--group-by` — column(s) to group by (required, repeatable)
-- `-c` / `--column` — result column name (default: `mr_result`)
+- `--group-key-column` — name of the group-key column in output (default: `group`)
+- `-c` / `--column` — result column name (default: `mr_result`; must differ from `--group-key-column`)
 - `-f` / `--format` — default format for both directions
 - `--input-format` / `--output-format` — override format per direction
 - `--where` — pre-filter rows
@@ -486,7 +573,7 @@ Options:
 - `-j` / `--parallel` — concurrent groups
 - `-m` / `--model`, `--worker-model`, `--planning-model`
 - `-n` / `--limit` — only process first N groups
-- `--repair` — retry failed groups (requires `-o`)
+- `--repair` — retry failed groups (requires `-o`; use the same `--group-key-column` and `-c` as the original run)
 - `--dry-run` — show a sample prompt and exit without making LLM calls
 - `-v` / `--verbose` — print each prompt as it is sent
 
@@ -570,7 +657,9 @@ just fix        # auto-fix linting and formatting
 just check      # lint + test
 ```
 
-See `DESIGN.md` for architectural notes.
+Release notes live in
+[CHANGELOG.md](CHANGELOG.md); maintainers can follow [docs/release.md](docs/release.md)
+for versioning, tags, and PyPI.
 
 ## Future Work
 
