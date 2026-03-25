@@ -490,7 +490,11 @@ class MapProcessor:
                             multiple,
                             typed=output_typed,
                         )
-                        if not resume_state.done_indices and not resume_state.passthrough_indices and existing_output:
+                        if (
+                            not resume_state.done_indices
+                            and not resume_state.passthrough_indices
+                            and existing_output
+                        ):
                             raise click.ClickException(
                                 f"{output_path} exists but does not match the input shape. "
                                 "Use --force to overwrite, or remove the file and re-run."
@@ -532,7 +536,9 @@ class MapProcessor:
             if mode == "expression":
                 deterministic = _compile_expression(instruction)
             elif mode == "interactive":
-                if resume_state and (resume_state.done_indices or resume_state.passthrough_indices):
+                if resume_state and (
+                    resume_state.done_indices or resume_state.passthrough_indices
+                ):
                     prompt_text = instruction
                 else:
                     plan = _interactive_plan_map(
@@ -611,7 +617,9 @@ class MapProcessor:
                     has_gaps = bool(resume_state and resume_state.gap_indices)
                     output_ends_at_match = resume_state is not None and len(
                         existing_output
-                    ) == len(resume_state.done_indices) + len(resume_state.passthrough_indices)
+                    ) == len(resume_state.done_indices) + len(
+                        resume_state.passthrough_indices
+                    )
                     is_fresh_file = (
                         resume_state is None
                         and output_path is not None
@@ -629,7 +637,10 @@ class MapProcessor:
                         and (
                             (
                                 resume_state is not None
-                                and (resume_state.done_indices or resume_state.passthrough_indices)
+                                and (
+                                    resume_state.done_indices
+                                    or resume_state.passthrough_indices
+                                )
                                 and not has_gaps
                                 and output_ends_at_match
                             )
@@ -1676,9 +1687,7 @@ def _run_reduce_groups(
     if parallel == 1:
         for i, (group_key, group_rows) in enumerate(group_items):
             try:
-                result = _submit_and_wait(
-                    _reduce_one, (group_key, group_rows), timeout
-                )
+                result = _submit_and_wait(_reduce_one, (group_key, group_rows), timeout)
                 results.append(result)
             except Exception as exc:
                 failed += 1
@@ -1902,15 +1911,18 @@ def _match_map_output(
                     state.done_rows.append(output_rows[out_idx])
                     out_idx += 1
         elif (
-            _is_superset(out_row, in_row, typed=typed)
-            and target_column not in out_row
+            _is_superset(out_row, in_row, typed=typed) and target_column not in out_row
         ):
             state.passthrough_indices.add(in_idx)
             state.last_match_index = in_idx
             out_idx += 1
 
     for in_idx in range(len(input_rows)):
-        if in_idx not in state.done_indices and in_idx not in state.passthrough_indices and in_idx <= state.last_match_index:
+        if (
+            in_idx not in state.done_indices
+            and in_idx not in state.passthrough_indices
+            and in_idx <= state.last_match_index
+        ):
             state.gap_indices.append(in_idx)
 
     state.tail_start = state.last_match_index + 1

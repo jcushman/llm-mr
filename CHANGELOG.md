@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-03-25
+
 ### Added
 
 - **Incremental output**: Results are written to disk as they arrive, preventing data loss on crashes or interruptions. Streaming-capable formats (CSV, JSONL) append rows directly; non-streaming formats (XLSX) use a `.wal` sidecar.
@@ -12,6 +14,7 @@
 - `open_append` implemented for CSV and JSONL output plugins.
 - **`ReorderBuffer`** for maintaining input ordering with parallel batches during incremental output.
 - **Filter `--err` support**: Filter errors are now caught per-batch and recorded to the `.err` sidecar, enabling filter resume.
+- **`--timeout` flag** (default: 120s) for `map`, `reduce`, and `filter`: Fails LLM batches that exceed the deadline, records them in `.err`, and retries on the next auto-resume run. Prevents silent hangs from unresponsive providers.
 
 ### Changed
 
@@ -27,5 +30,6 @@
 - Initial PyPI release: `llm mr` commands (`map`, `reduce`, `filter`) for CSV, JSONL, and XLSX.
 - Pluggable I/O via the `llm_mr` entry-point group (`register_mr_inputs` / `register_mr_outputs`).
 
-[Unreleased]: https://github.com/jcushman/llm-mr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jcushman/llm-mr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jcushman/llm-mr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jcushman/llm-mr/releases/tag/v0.1.0

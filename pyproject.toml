@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "llm-mr"
-version = "0.1.0"
+version = "0.2.0"
 description = "Map-reduce spreadsheet operations powered by LLM prompts"
 readme = "README.md"
 license = "MIT"
