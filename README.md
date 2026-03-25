@@ -365,6 +365,15 @@ llm mr map "..." -p -i data.jsonl -c result -j 20 -o output.jsonl
 llm mr map "..." -p -i data.jsonl -c result -j 4 -o output.jsonl
 ```
 
+Each LLM batch has a **120-second timeout** by default. If a batch doesn't
+return in time, it is recorded as a failure and retried on the next run.
+Use `--timeout` to adjust:
+
+```bash
+# Generous timeout for large batches
+llm mr map "..." -p -i data.jsonl -c result --timeout 300 -o output.jsonl
+```
+
 Error details are written to a sidecar file (`<output>.err`) as JSONL. The
 `.err` file is for diagnostics — the resume logic does not depend on it
 (except for filter, where it is used to distinguish "errored" from "intentionally filtered out").
@@ -527,7 +536,7 @@ Options:
 - `-c` / `--column` — target column name (default: `mr_result`)
 - `-f` / `--format` — default format for both directions
 - `--input-format` / `--output-format` — override format per direction
-- `--where` — pre-filter rows (e.g. `status=active`, `score>=10`)
+- `--where` — pre-filter rows (e.g. `status=active`, `score>=10`); unmatched rows are passed through with an empty output column
 - `--few-shot N` — use N existing values as examples
 - `--batch-size` / `--max-chars` — control batching
 - `-j` / `--parallel` — concurrent LLM calls (default: 1)
@@ -536,6 +545,7 @@ Options:
 - `--worker-model` — model for per-item work (defaults to `-m`)
 - `--planning-model` — model for interactive planning (defaults to `-m`)
 - `-n` / `--limit` — only process first N rows
+- `--timeout` — seconds per LLM batch before failing it (default: 120)
 - `--force` — overwrite existing output even if it doesn't match the input (skips resume)
 - `--err PATH` — override the error sidecar path (default: `<output>.err`)
 - `--dry-run` — show a sample prompt and exit without making LLM calls
@@ -573,11 +583,12 @@ Options:
 - `-c` / `--column` — result column name (default: `mr_result`; must differ from `--group-key-column`)
 - `-f` / `--format` — default format for both directions
 - `--input-format` / `--output-format` — override format per direction
-- `--where` — pre-filter rows
+- `--where` — pre-filter rows; unmatched rows are excluded from output
 - `--max-chars` — max characters per reduction prompt
 - `-j` / `--parallel` — concurrent groups
 - `-m` / `--model`, `--worker-model`, `--planning-model`
 - `-n` / `--limit` — only process first N groups
+- `--timeout` — seconds per LLM group before failing it (default: 120)
 - `--force` — overwrite existing output even if it doesn't match (skips resume)
 - `--err PATH` — override the error sidecar path (default: `<output>.err`)
 - `--dry-run` — show a sample prompt and exit without making LLM calls
@@ -607,11 +618,12 @@ Options:
 - `-o` / `--output` — output path (omit for stdout)
 - `-f` / `--format` — default format for both directions
 - `--input-format` / `--output-format` — override format per direction
-- `--where` — pre-filter before instruction filter
+- `--where` — pre-filter before instruction filter; unmatched rows are excluded from output
 - `--batch-size` / `--max-chars` — control batching for LLM mode
 - `-j` / `--parallel` — concurrent batches
 - `-m` / `--model`, `--worker-model`, `--planning-model`
 - `-n` / `--limit` — only consider first N rows
+- `--timeout` — seconds per LLM batch before failing it (default: 120)
 - `--force` — overwrite existing output even if it doesn't match (skips resume)
 - `--err PATH` — override the error sidecar path (default: `<output>.err`)
 - `--dry-run` — show a sample prompt and exit without making LLM calls

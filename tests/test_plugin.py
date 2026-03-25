@@ -2459,6 +2459,114 @@ def test_map_resume_with_where(tmp_path, mock_model):
     assert len(mock_model.prompt_history) == 1
 
 
+def test_map_resume_with_where_jsonl(tmp_path, mock_model):
+    """Resume works with --where when JSONL pass-through rows lack the target column."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "text": None, "note": "alpha"},
+            {"id": "2", "text": "hello", "note": "beta"},
+            {"id": "3", "text": None, "note": "gamma"},
+            {"id": "4", "text": "world", "note": "delta"},
+        ],
+    )
+    _write_jsonl(
+        output_path,
+        [
+            {"id": "1", "text": None, "note": "alpha"},
+            {"id": "2", "text": "hello", "note": "beta", "mr_result": "Result 2"},
+            {"id": "3", "text": None, "note": "gamma"},
+            {"id": "4", "text": "world", "note": "delta", "mr_result": ""},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 4"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--where",
+            "text!=null",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 4
+    assert "mr_result" not in written_rows[0]
+    assert written_rows[1]["mr_result"] == "Result 2"
+    assert "mr_result" not in written_rows[2]
+    assert written_rows[3]["mr_result"] == "Result 4"
+
+    assert len(mock_model.prompt_history) == 1
+
+
+def test_map_resume_with_where_all_passthrough(tmp_path, mock_model):
+    """Resume works when all existing output rows are pass-through (no target column)."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "text": None, "note": "alpha"},
+            {"id": "2", "text": None, "note": "beta"},
+            {"id": "3", "text": "hello", "note": "gamma"},
+        ],
+    )
+    _write_jsonl(
+        output_path,
+        [
+            {"id": "1", "text": None, "note": "alpha"},
+            {"id": "2", "text": None, "note": "beta"},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 3"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--where",
+            "text!=null",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 3
+    assert "mr_result" not in written_rows[0]
+    assert "mr_result" not in written_rows[1]
+    assert written_rows[2]["mr_result"] == "Result 3"
+
+    assert len(mock_model.prompt_history) == 1
+
+
 def test_map_no_resume_on_stdout(tmp_path, mock_model):
     """Stdout output never resumes — always processes all rows."""
     rows = [
@@ -2682,8 +2790,32 @@ def test_map_resume_state():
     ]
     state = _match_map_output(input_rows, output_rows, "result")
     assert state.done_indices == {0}
+    assert state.passthrough_indices == set()
     assert state.gap_indices == []
     assert state.tail_start == 1
+
+
+def test_map_resume_state_with_passthrough():
+    """Unit test for _match_map_output with pass-through rows."""
+    from llm_mr.processors import _match_map_output
+
+    input_rows = [
+        {"id": "1", "text": None},
+        {"id": "2", "text": "hello"},
+        {"id": "3", "text": None},
+        {"id": "4", "text": "world"},
+    ]
+    output_rows = [
+        {"id": "1", "text": None},
+        {"id": "2", "text": "hello", "result": "R2"},
+        {"id": "3", "text": None},
+        {"id": "4", "text": "world", "result": ""},
+    ]
+    state = _match_map_output(input_rows, output_rows, "result")
+    assert state.done_indices == {1}
+    assert state.passthrough_indices == {0, 2}
+    assert state.gap_indices == []
+    assert state.tail_start == 3
 
 
 def test_reorder_buffer():
@@ -2741,8 +2873,224 @@ def test_map_resume_empty_output_file(tmp_path, mock_model):
 
 
 # ---------------------------------------------------------------------------
+# Timeout tests
+# ---------------------------------------------------------------------------
+
+
+def _register_slow_model(delay=10, slow_on_calls=None):
+    """Create and register a SlowMockModel, returning (model, plugin)."""
+    model = SlowMockModel(slow_on_calls=slow_on_calls or {0}, delay=delay)
+
+    class TestPlugin:
+        __name__ = "TestSlowPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-slow")
+    return model, plugin
+
+
+def test_map_timeout_records_error(tmp_path):
+    """A batch that exceeds --timeout is recorded as a failure in .err."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [{"id": "1", "note": "alpha"}]
+    _write_csv(input_path, rows)
+
+    model, plugin = _register_slow_model(delay=10, slow_on_calls={0})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "never"}}))
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "slow-demo",
+                "--timeout",
+                "0.5",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "failed" in result.output
+
+        errors = _read_err(err_path)
+        assert len(errors) == 1
+        assert errors[0]["row_indices"] == [0]
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_filter_timeout_records_error(tmp_path):
+    """A filter batch that exceeds --timeout is treated as a failure."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [{"id": "1", "note": "alpha"}]
+    _write_csv(input_path, rows)
+
+    model, plugin = _register_slow_model(delay=10, slow_on_calls={0})
+    model.queue_response(json.dumps({"row_0": {"verdict": "keep"}}))
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "filter",
+                "Keep all",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "slow-demo",
+                "--timeout",
+                "0.5",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "failed" in result.output
+
+        errors = _read_err(err_path)
+        assert len(errors) == 1
+        assert errors[0]["row_indices"] == [0]
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_reduce_timeout_records_error(tmp_path):
+    """A reduce group that exceeds --timeout is recorded as a failure."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [
+        {"category": "A", "value": "1"},
+        {"category": "A", "value": "2"},
+    ]
+    _write_csv(input_path, rows)
+
+    model, plugin = _register_slow_model(delay=10, slow_on_calls={0})
+    model.queue_response(json.dumps({"mr_result": "sum is 3"}))
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "reduce",
+                "Summarize values",
+                "-p",
+                "-i",
+                str(input_path),
+                "--group-by",
+                "category",
+                "--output",
+                str(output_path),
+                "--model",
+                "slow-demo",
+                "--timeout",
+                "0.5",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "failed" in result.output
+
+        errors = _read_err(err_path)
+        assert len(errors) == 1
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_map_timeout_fast_batches_succeed(tmp_path):
+    """Batches that complete within --timeout succeed; slow ones are recorded as failed."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    err_path = tmp_path / "output.csv.err"
+    rows = [{"id": "1", "note": "alpha"}, {"id": "2", "note": "beta"}]
+    _write_csv(input_path, rows)
+
+    model, plugin = _register_slow_model(delay=10, slow_on_calls={1})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+    model.queue_response(json.dumps({"row_0": {"mr_result": "never"}}))
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "slow-demo",
+                "--timeout",
+                "0.5",
+                "--batch-size",
+                "1",
+            ],
+        )
+        assert result.exit_code == 0
+
+        written_rows = _read_csv(output_path)
+        assert written_rows[0]["mr_result"] == "Result 1"
+        assert "1 batches failed" in result.output
+
+        errors = _read_err(err_path)
+        assert len(errors) == 1
+        assert errors[0]["row_indices"] == [1]
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+# ---------------------------------------------------------------------------
 # Shared test helpers
 # ---------------------------------------------------------------------------
+
+
+class SlowMockModel(llm.Model):
+    """Model that sleeps on specific calls by index, to test timeouts."""
+
+    model_id = "slow-demo"
+
+    def __init__(self, slow_on_calls=None, delay=10):
+        self.slow_on_calls = slow_on_calls or set()
+        self.delay = delay
+        self.responses = []
+        self.call_count = 0
+
+    def queue_response(self, text: str) -> None:
+        self.responses.append(text)
+
+    @property
+    def supports_schema(self):
+        return True
+
+    def execute(self, prompt, stream, response, conversation):
+        import time
+
+        idx = self.call_count
+        self.call_count += 1
+        if idx in self.slow_on_calls:
+            time.sleep(self.delay)
+        text = self.responses.pop(0) if self.responses else ""
+        return [text]
 
 
 class FailingMockModel(llm.Model):

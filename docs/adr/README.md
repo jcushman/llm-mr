@@ -2,6 +2,7 @@
 
 Create new ADRs with `just adr <title>`, then edit created file.
 
+* 2026-03-25: [Batch Timeout](2026-03-25-batch_timeout.md)
 * 2026-03-24: [Incremental Output and Resume](2026-03-24-incremental_output_and_resume.md)
 * 2026-03-13: [Three Execution Modes](2026-03-13-three_execution_modes.md)
 * 2026-03-13: [I/O Plugin Architecture](2026-03-13-i_o_plugin_architecture.md)

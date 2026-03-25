@@ -135,6 +135,13 @@ def _common_options(f):
         help="Only process the first N items",
     )(f)
     f = click.option(
+        "--timeout",
+        type=click.FloatRange(min=0, min_open=True),
+        default=120,
+        show_default=True,
+        help="Seconds to wait for each LLM batch before failing it",
+    )(f)
+    f = click.option(
         "--dry-run",
         is_flag=True,
         help="Show a sample prompt and exit without making LLM calls",
@@ -401,6 +408,7 @@ class MapProcessor:
             parallel: int,
             force: bool,
             err_file: Optional[Path],
+            timeout: float,
             dry_run: bool,
             verbose: bool,
         ) -> None:
@@ -482,7 +490,7 @@ class MapProcessor:
                             multiple,
                             typed=output_typed,
                         )
-                        if not resume_state.done_indices and existing_output:
+                        if not resume_state.done_indices and not resume_state.passthrough_indices and existing_output:
                             raise click.ClickException(
                                 f"{output_path} exists but does not match the input shape. "
                                 "Use --force to overwrite, or remove the file and re-run."
@@ -501,17 +509,15 @@ class MapProcessor:
                 output_val_by_idx: Dict[int, Any] = {}
                 out_cursor = 0
                 for in_idx, in_row in enumerate(rows):
-                    if (
-                        out_cursor < len(existing_output)
-                        and _is_superset(
-                            existing_output[out_cursor], in_row, typed=output_typed
-                        )
-                        and _has_value(existing_output[out_cursor].get(target_column))
+                    if out_cursor < len(existing_output) and _is_superset(
+                        existing_output[out_cursor], in_row, typed=output_typed
                     ):
-                        output_val_by_idx[in_idx] = existing_output[out_cursor][
-                            target_column
-                        ]
-                        out_cursor += 1
+                        out_row = existing_output[out_cursor]
+                        if _has_value(out_row.get(target_column)):
+                            output_val_by_idx[in_idx] = out_row[target_column]
+                            out_cursor += 1
+                        elif target_column not in out_row:
+                            out_cursor += 1
 
                 for idx in resume_state.done_indices:
                     if idx < len(rows):
@@ -526,7 +532,7 @@ class MapProcessor:
             if mode == "expression":
                 deterministic = _compile_expression(instruction)
             elif mode == "interactive":
-                if resume_state and resume_state.done_indices:
+                if resume_state and (resume_state.done_indices or resume_state.passthrough_indices):
                     prompt_text = instruction
                 else:
                     plan = _interactive_plan_map(
@@ -605,7 +611,7 @@ class MapProcessor:
                     has_gaps = bool(resume_state and resume_state.gap_indices)
                     output_ends_at_match = resume_state is not None and len(
                         existing_output
-                    ) == len(resume_state.done_indices)
+                    ) == len(resume_state.done_indices) + len(resume_state.passthrough_indices)
                     is_fresh_file = (
                         resume_state is None
                         and output_path is not None
@@ -623,7 +629,7 @@ class MapProcessor:
                         and (
                             (
                                 resume_state is not None
-                                and resume_state.done_indices
+                                and (resume_state.done_indices or resume_state.passthrough_indices)
                                 and not has_gaps
                                 and output_ends_at_match
                             )
@@ -648,6 +654,7 @@ class MapProcessor:
                             fieldnames,
                             wal_path,
                             verbose,
+                            timeout=timeout,
                         )
                     else:
                         failed = _run_map_batches(
@@ -663,6 +670,7 @@ class MapProcessor:
                             err_path,
                             verbose,
                             wal_path=wal_path,
+                            timeout=timeout,
                         )
 
                     if failed:
@@ -797,6 +805,7 @@ class ReduceProcessor:
             parallel: int,
             force: bool,
             err_file: Optional[Path],
+            timeout: float,
             dry_run: bool,
             verbose: bool,
         ) -> None:
@@ -940,6 +949,7 @@ class ReduceProcessor:
                         err_path,
                         verbose,
                         wal_path=wal_path,
+                        timeout=timeout,
                     )
                     if failed:
                         click.echo(
@@ -1051,6 +1061,7 @@ class FilterProcessor:
             parallel: int,
             force: bool,
             err_file: Optional[Path],
+            timeout: float,
             dry_run: bool,
             verbose: bool,
         ) -> None:
@@ -1195,6 +1206,7 @@ class FilterProcessor:
                         err_path=err_path,
                         row_indices=pending_indices,
                         wal_path=wal_path,
+                        timeout=timeout,
                     )
 
                     # Merge with already-kept rows from resume
@@ -1470,6 +1482,23 @@ def _confirm_plan(
 
 
 # ---------------------------------------------------------------------------
+# Timeout helper
+# ---------------------------------------------------------------------------
+
+
+def _submit_and_wait(fn, args, timeout):
+    """Run *fn(*args)* in a thread with an optional timeout.
+
+    Used by the sequential (parallel=1) paths so that a single hung LLM call
+    doesn't block forever.  The parallel paths use ``future.result(timeout=…)``
+    directly on the executor.
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn, *args)
+        return future.result(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
 # Filter via LLM
 # ---------------------------------------------------------------------------
 
@@ -1485,6 +1514,7 @@ def _run_filter_llm(
     err_path: Optional[Path] = None,
     row_indices: Optional[List[int]] = None,
     wal_path: Optional[Path] = None,
+    timeout: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Classify each row with the LLM and keep rows where result is truthy."""
     batches = _prepare_batches(rows, batch_size, max_chars)
@@ -1510,7 +1540,7 @@ def _run_filter_llm(
     if parallel == 1:
         for i, (batch, indices) in enumerate(zip(batches, index_batches)):
             try:
-                verdicts = _process_one(batch)
+                verdicts = _submit_and_wait(_process_one, (batch,), timeout)
             except Exception as exc:
                 _append_error(err_path, {"row_indices": indices, "error": str(exc)})
                 results.extend([False] * len(batch))
@@ -1531,7 +1561,7 @@ def _run_filter_llm(
             for future in as_completed(futures):
                 idx, indices = futures[future]
                 try:
-                    verdicts = future.result()
+                    verdicts = future.result(timeout=timeout)
                     batch_verdicts[idx] = verdicts
                 except Exception as exc:
                     _append_error(err_path, {"row_indices": indices, "error": str(exc)})
@@ -1632,6 +1662,7 @@ def _run_reduce_groups(
     err_path: Path,
     verbose: bool = False,
     wal_path: Optional[Path] = None,
+    timeout: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     def _reduce_one(group_key, group_rows):
         value = _reduce_rows(
@@ -1645,7 +1676,9 @@ def _run_reduce_groups(
     if parallel == 1:
         for i, (group_key, group_rows) in enumerate(group_items):
             try:
-                result = _reduce_one(group_key, group_rows)
+                result = _submit_and_wait(
+                    _reduce_one, (group_key, group_rows), timeout
+                )
                 results.append(result)
             except Exception as exc:
                 failed += 1
@@ -1670,7 +1703,7 @@ def _run_reduce_groups(
             for future in as_completed(futures):
                 group_idx, group_key = futures[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=timeout)
                     results.append(result)
                 except Exception as exc:
                     failed += 1
@@ -1827,6 +1860,7 @@ class MapResumeState:
     """Result of walking input + output to determine resume state for map."""
 
     done_indices: Set[int] = field(default_factory=set)
+    passthrough_indices: Set[int] = field(default_factory=set)
     done_rows: List[Dict[str, Any]] = field(default_factory=list)
     gap_indices: List[int] = field(default_factory=list)
     tail_start: int = 0
@@ -1867,11 +1901,16 @@ def _match_map_output(
                 ):
                     state.done_rows.append(output_rows[out_idx])
                     out_idx += 1
-        else:
-            pass
+        elif (
+            _is_superset(out_row, in_row, typed=typed)
+            and target_column not in out_row
+        ):
+            state.passthrough_indices.add(in_idx)
+            state.last_match_index = in_idx
+            out_idx += 1
 
     for in_idx in range(len(input_rows)):
-        if in_idx not in state.done_indices and in_idx <= state.last_match_index:
+        if in_idx not in state.done_indices and in_idx not in state.passthrough_indices and in_idx <= state.last_match_index:
             state.gap_indices.append(in_idx)
 
     state.tail_start = state.last_match_index + 1
@@ -2035,6 +2074,9 @@ def _merge_map_output(
                 ):
                     merged.append(existing_output[out_idx])
                     out_idx += 1
+        elif in_idx in resume_state.passthrough_indices:
+            merged.append(existing_output[out_idx])
+            out_idx += 1
         elif in_idx in wal_by_index:
             row = dict(in_row)
             row[target_column] = wal_by_index[in_idx]
@@ -2157,6 +2199,7 @@ def _run_map_batches(
     err_path: Path,
     verbose: bool = False,
     wal_path: Optional[Path] = None,
+    timeout: Optional[float] = None,
 ) -> int:
     pending_indices = [i for i, _ in pending]
     pending_rows = [row for _, row in pending]
@@ -2173,14 +2216,18 @@ def _run_map_batches(
     if parallel == 1:
         for i, (batch, indices) in enumerate(zip(batches, index_batches)):
             try:
-                _process_batch(
-                    model_obj,
-                    prompt,
-                    target_column,
-                    batch,
-                    few_shot_examples,
-                    multiple,
-                    verbose,
+                _submit_and_wait(
+                    _process_batch,
+                    (
+                        model_obj,
+                        prompt,
+                        target_column,
+                        batch,
+                        few_shot_examples,
+                        multiple,
+                        verbose,
+                    ),
+                    timeout,
                 )
             except Exception as exc:
                 failed += 1
@@ -2213,7 +2260,7 @@ def _run_map_batches(
             for future in as_completed(futures):
                 batch_idx, indices, batch = futures[future]
                 try:
-                    future.result()
+                    future.result(timeout=timeout)
                 except Exception as exc:
                     failed += 1
                     _append_error(err_path, {"row_indices": indices, "error": str(exc)})
@@ -2253,6 +2300,7 @@ def _run_map_batches_incremental(
     fieldnames: List[str],
     wal_path: Optional[Path],
     verbose: bool = False,
+    timeout: Optional[float] = None,
 ) -> int:
     """Run map batches with incremental append to the output file.
 
@@ -2288,14 +2336,18 @@ def _run_map_batches_incremental(
             for batch_num, (batch, indices) in enumerate(zip(batches, index_batches)):
                 batch_failed = False
                 try:
-                    _process_batch(
-                        model_obj,
-                        prompt,
-                        target_column,
-                        batch,
-                        few_shot_examples,
-                        multiple,
-                        verbose,
+                    _submit_and_wait(
+                        _process_batch,
+                        (
+                            model_obj,
+                            prompt,
+                            target_column,
+                            batch,
+                            few_shot_examples,
+                            multiple,
+                            verbose,
+                        ),
+                        timeout,
                     )
                 except Exception as exc:
                     batch_failed = True
@@ -2305,8 +2357,6 @@ def _run_map_batches_incremental(
                         f"  Batch {batch_num + 1}/{len(batches)} failed: {exc}",
                         err=True,
                     )
-                # Always add to reorder buffer so failed rows (with empty
-                # target column) are still written in order.
                 completed_rows = [(idx, row) for idx, row in zip(indices, batch)]
                 ready = reorder.add_batch(batch_num, completed_rows)
                 _flush_rows(ready)
@@ -2336,7 +2386,7 @@ def _run_map_batches_incremental(
                     batch_num, indices, batch = futures[future]
                     batch_failed = False
                     try:
-                        future.result()
+                        future.result(timeout=timeout)
                     except Exception as exc:
                         batch_failed = True
                         failed += 1
