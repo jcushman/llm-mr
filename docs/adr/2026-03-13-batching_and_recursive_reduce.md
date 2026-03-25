@@ -15,7 +15,7 @@ are model-specific and the `llm` library does not expose a tokenizer API.
 **Character-based `--max-chars`.** Prompt size is controlled by `--max-chars`,
 a character count threshold. The ~4 characters/token heuristic for English
 text is coarse but works in practice. Context-window overflows are caught by
-the `.err` / `--repair` mechanism, so the heuristic does not need to be exact.
+the `.err` sidecar and auto-resume, so the heuristic does not need to be exact.
 
 **Recursive summarization for reduce.** When a reduce group exceeds
 `--max-chars`, the group is split in half and each half is reduced separately.

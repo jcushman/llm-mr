@@ -352,20 +352,23 @@ In `-p` mode, only the worker model is used. In `-e` mode, no model is used.
 
 ## Recovering from Failures
 
-Both `map` and `reduce` write a sidecar error file (`<output>.err`) when batches
-or groups fail. Use `--repair` to retry only the failed items:
+All three commands (`map`, `reduce`, `filter`) support **auto-resume**: if a
+run is interrupted or some batches fail, simply re-run the same command. Already-
+processed rows are detected via content matching and skipped automatically.
 
 ```bash
 # Initial run — some batches may time out or fail
 llm mr map "..." -p -i data.jsonl -c result -j 20 -o output.jsonl
-# Warning: 3 batches failed; see output.jsonl.err — rerun with --repair
+# Warning: 3 batches failed; see output.jsonl.err — rerun to retry
 
-# Retry only the failed rows
-llm mr map "..." -p -i data.jsonl -c result -j 4 -o output.jsonl --repair
+# Just re-run — already-done rows are skipped, only failures are retried
+llm mr map "..." -p -i data.jsonl -c result -j 4 -o output.jsonl
 ```
 
-The `--repair` flag is idempotent — if some retries still fail, they stay in
-the `.err` file. Delete the output and `.err` files to start fresh.
+Error details are written to a sidecar file (`<output>.err`) as JSONL. The
+`.err` file is for diagnostics — the resume logic does not depend on it
+(except for filter, where it is used to distinguish "errored" from "intentionally filtered out").
+Use `--force` to discard an existing output and start fresh.
 
 When output goes to stdout (no `-o`), error records are written as JSONL lines
 to stderr instead of a sidecar file. You can redirect them:
@@ -374,7 +377,8 @@ to stderr instead of a sidecar file. You can redirect them:
 cat data.jsonl | llm mr map "..." -p 2>errors.jsonl > out.jsonl
 ```
 
-`--repair` requires `-o` — it cannot be used with stdout output.
+Resume is only available when writing to a file (`-o`). Stdout output is not
+resumable.
 
 ## Python Expressions (`-e`)
 
@@ -532,7 +536,8 @@ Options:
 - `--worker-model` — model for per-item work (defaults to `-m`)
 - `--planning-model` — model for interactive planning (defaults to `-m`)
 - `-n` / `--limit` — only process first N rows
-- `--repair` — retry failed rows from the `.err` sidecar (requires `-o`)
+- `--force` — overwrite existing output even if it doesn't match the input (skips resume)
+- `--err PATH` — override the error sidecar path (default: `<output>.err`)
 - `--dry-run` — show a sample prompt and exit without making LLM calls
 - `-v` / `--verbose` — print each prompt as it is sent
 
@@ -573,7 +578,8 @@ Options:
 - `-j` / `--parallel` — concurrent groups
 - `-m` / `--model`, `--worker-model`, `--planning-model`
 - `-n` / `--limit` — only process first N groups
-- `--repair` — retry failed groups (requires `-o`; use the same `--group-key-column` and `-c` as the original run)
+- `--force` — overwrite existing output even if it doesn't match (skips resume)
+- `--err PATH` — override the error sidecar path (default: `<output>.err`)
 - `--dry-run` — show a sample prompt and exit without making LLM calls
 - `-v` / `--verbose` — print each prompt as it is sent
 
@@ -606,6 +612,8 @@ Options:
 - `-j` / `--parallel` — concurrent batches
 - `-m` / `--model`, `--worker-model`, `--planning-model`
 - `-n` / `--limit` — only consider first N rows
+- `--force` — overwrite existing output even if it doesn't match (skips resume)
+- `--err PATH` — override the error sidecar path (default: `<output>.err`)
 - `--dry-run` — show a sample prompt and exit without making LLM calls
 - `-v` / `--verbose` — print each prompt as it is sent
 
@@ -666,16 +674,17 @@ for versioning, tags, and PyPI.
 
 - **Rate-limiting for `-j` / `--parallel`** — Currently `-j 20` fires all
   requests concurrently with no throttling, which can trigger API rate limits
-  (HTTP 429). Failed batches land in the `.err` sidecar and can be retried
-  with `--repair`, but adding automatic retry with exponential backoff would
-  make high-parallelism runs more robust.
+  (HTTP 429). Failed batches land in the `.err` sidecar and are retried on
+  the next run via auto-resume, but adding automatic retry with exponential
+  backoff would make high-parallelism runs more robust.
 
 - **Token-limit awareness** — The `--max-chars` flag uses character counts as
   a proxy for token limits. Actual token counts are model-specific and the
   `llm` library does not expose a tokenizer API, so precise per-model token
   budgeting is not feasible in the general case. The current heuristic
   (roughly 4 characters per token for English text) works in practice, and
-  context-window errors are caught by the `.err` / `--repair` mechanism.
+  context-window errors are caught by the `.err` sidecar and retried on
+  re-run.
 
 ## See Also
 
