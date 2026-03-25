@@ -14,11 +14,33 @@ Configure **Trusted Publishing** on PyPI so GitHub Actions can upload without a 
    - **Workflow name:** `publish.yml`.
    - **Environment:** `pypi` (must match the workflow).
 
-### GitHub environment (optional but recommended)
+### GitHub environment (`pypi`)
 
-In the repo **Settings → Environments**, create an environment named **`pypi`**. You can require reviewers or restrict to `main` so only intentional tag pushes trigger publishes.
+The workflow sets `environment: pypi` so PyPI **Trusted Publishing** can require that
+exact environment name, and so you can use GitHub’s deployment protections.
 
-The workflow attaches `environment: pypi` so PyPI’s trusted-publisher settings and GitHub protections stay aligned.
+**Important:** The publish job runs on a **tag** push (`v*`), not a branch push. If
+the environment uses **Deployment branches and tags → Selected branches and tags**,
+allowing only **`main`** is *not* enough — GitHub will reject the run with errors
+like *“Tag 'v0.1.0' is not allowed to deploy… due to environment protection rules”*.
+
+Configure it one of these ways:
+
+1. **Recommended (tags + main):** In **Settings → Environments → pypi → Deployment
+   branches and tags**, keep **Selected branches and tags**, then **Add deployment
+   branch or tag rule**:
+   - Add **`main`** (so any future branch-based jobs could use this environment), and
+   - Add a **tag** rule with pattern **`v*`** (matches `v0.1.0`, `v1.2.3`, etc.).
+
+2. **Simpler (all refs):** Set the environment to **All branches and tags** if you
+   don’t need a whitelist. (Weaker restriction; fine for many small projects.)
+
+3. **No GitHub environment:** You could remove `environment:` from `.github/workflows/publish.yml`
+   and change PyPI’s trusted publisher to use an **empty** environment name — then
+   GitHub won’t apply environment rules, but you lose that layer of control.
+
+Wait for **Required reviewers** only if you want a human to approve each PyPI upload;
+that’s separate from branch/tag rules.
 
 ## Cutting a release
 
