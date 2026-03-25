@@ -60,6 +60,27 @@ class StreamableOutput(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class AppendableOutput(Protocol):
+    """Protocol for output plugins that support incremental append to a file.
+
+    Plugins implementing this can open a file for appending and write rows
+    one at a time, enabling incremental output and crash recovery.
+    """
+
+    def open_append(
+        self, path: Path, fieldnames: Sequence[str]
+    ) -> ContextManager["RowAppender"]: ...
+
+
+class RowAppender(Protocol):
+    """Context-managed writer that appends individual rows to an open file."""
+
+    def append(self, row: Row) -> None: ...
+
+    def flush(self) -> None: ...
+
+
 class InputRegistry:
     def __init__(self) -> None:
         self._plugins: Dict[str, InputPlugin] = {}

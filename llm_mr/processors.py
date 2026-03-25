@@ -4,9 +4,10 @@ import json
 import shutil
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     Any,
@@ -26,6 +27,7 @@ import llm
 from llm.cli import get_default_model
 
 from .registries import (
+    AppendableOutput,
     PluginContext,
     StreamableInput,
     StreamableOutput,
@@ -365,7 +367,9 @@ class MapProcessor:
             help="Concurrent batches",
         )
         @click.option(
-            "--repair", is_flag=True, help="Retry failed rows from the .err sidecar"
+            "--force",
+            is_flag=True,
+            help="Overwrite existing output file even if it doesn't match input",
         )
         @click.option(
             "--err",
@@ -395,7 +399,7 @@ class MapProcessor:
             few_shot: int,
             multiple: bool,
             parallel: int,
-            repair: bool,
+            force: bool,
             err_file: Optional[Path],
             dry_run: bool,
             verbose: bool,
@@ -412,28 +416,7 @@ class MapProcessor:
                 input_path, output_path, format_, input_format, output_format
             )
             err_path = err_file if err_file is not None else _err_path_for(output_path)
-
-            if repair:
-                if err_path is None:
-                    raise click.UsageError("--repair requires --output or --err")
-                if output_path is None:
-                    raise click.UsageError(
-                        "--repair requires --output to merge results"
-                    )
-                _map_repair(
-                    context,
-                    output_path,
-                    err_path,
-                    instruction,
-                    target_column,
-                    batch_size,
-                    max_chars,
-                    few_shot,
-                    worker_model or model,
-                    multiple,
-                    parallel,
-                )
-                return
+            wal_path = _wal_path_for(output_path)
 
             parsed_filters = [parse_filter(expr) for expr in filters]
 
@@ -470,25 +453,88 @@ class MapProcessor:
             if target_column not in fieldnames:
                 fieldnames.append(target_column)
 
+            # --- Resume: load existing output + WAL ---
+            resume_state: Optional[MapResumeState] = None
+            existing_output: List[Dict[str, Any]] = []
+            wal_records: List[Dict[str, Any]] = []
+
+            if (
+                output_path
+                and output_path.exists()
+                and output_path.stat().st_size > 0
+                and not in_place
+            ):
+                if not force:
+                    try:
+                        output_input_plugin = context.inputs.for_path(output_path)
+                        with output_input_plugin.open(output_path) as out_stream:
+                            existing_output, _ = _materialize(out_stream)
+                    except Exception:
+                        existing_output = []
+
+                    if existing_output:
+                        resume_state = _match_map_output(
+                            rows, existing_output, target_column, multiple
+                        )
+                        if not resume_state.done_indices and existing_output:
+                            raise click.ClickException(
+                                f"{output_path} exists but does not match the input shape. "
+                                "Use --force to overwrite, or remove the file and re-run."
+                            )
+
+                        if wal_path:
+                            wal_records = _read_wal(wal_path)
+                            wal_done: Set[int] = set()
+                            for rec in wal_records:
+                                wal_done.add(rec["i"])
+                            resume_state.done_indices |= wal_done
+
+            # Mark rows already done (from output or WAL) so they're skipped
+            if resume_state:
+                wal_by_idx: Dict[int, Any] = {rec["i"]: rec["v"] for rec in wal_records}
+                output_val_by_idx: Dict[int, Any] = {}
+                out_cursor = 0
+                for in_idx, in_row in enumerate(rows):
+                    if (
+                        out_cursor < len(existing_output)
+                        and _is_superset(existing_output[out_cursor], in_row)
+                        and _has_value(existing_output[out_cursor].get(target_column))
+                    ):
+                        output_val_by_idx[in_idx] = existing_output[out_cursor][
+                            target_column
+                        ]
+                        out_cursor += 1
+
+                for idx in resume_state.done_indices:
+                    if idx < len(rows):
+                        if idx in wal_by_idx:
+                            rows[idx][target_column] = wal_by_idx[idx]
+                        elif idx in output_val_by_idx:
+                            rows[idx][target_column] = output_val_by_idx[idx]
+
+            use_incremental = False
             deterministic = None
             prompt_text = instruction
             if mode == "expression":
                 deterministic = _compile_expression(instruction)
             elif mode == "interactive":
-                plan = _interactive_plan_map(
-                    instruction,
-                    target_column,
-                    fieldnames,
-                    planning_model,
-                    model,
-                    _extract_few_shot_examples(rows, target_column, few_shot),
-                )
-                if plan is None:
-                    raise SystemExit(0)
-                elif isinstance(plan, str):
-                    prompt_text = plan
+                if resume_state and resume_state.done_indices:
+                    prompt_text = instruction
                 else:
-                    deterministic = plan
+                    plan = _interactive_plan_map(
+                        instruction,
+                        target_column,
+                        fieldnames,
+                        planning_model,
+                        model,
+                        _extract_few_shot_examples(rows, target_column, few_shot),
+                    )
+                    if plan is None:
+                        raise SystemExit(0)
+                    elif isinstance(plan, str):
+                        prompt_text = plan
+                    else:
+                        deterministic = plan
 
             row_id_map = {id(row): i for i, row in enumerate(rows)}
             processed_indices: Set[int] = set()
@@ -519,6 +565,8 @@ class MapProcessor:
                     click.echo(
                         "No rows required LLM processing; nothing to do", err=True
                     )
+                    # Clean up WAL if all rows are done
+                    _delete_wal(wal_path)
                 else:
                     if dry_run:
                         _dry_run_map(
@@ -531,27 +579,89 @@ class MapProcessor:
                             max_chars,
                         )
                         return
+
                     _clear_err_file(err_path)
-                    failed = _run_map_batches(
-                        pending,
-                        worker,
-                        prompt_text,
-                        target_column,
-                        few_shot_examples,
-                        multiple,
-                        batch_size,
-                        max_chars,
-                        parallel,
-                        err_path,
-                        verbose,
+
+                    # Determine if we can stream-append rows directly.
+                    # Two cases qualify:
+                    #  - Resuming with only tail rows (existing output ends
+                    #    exactly at the last match, no gaps).
+                    #  - Fresh run to a new/empty file with an appendable
+                    #    format (ADR Case 1).
+                    output_plugin = (
+                        context.outputs.for_path(output_path) if output_path else None
                     )
+                    can_append = output_path is not None and isinstance(
+                        output_plugin, AppendableOutput
+                    )
+                    has_gaps = bool(resume_state and resume_state.gap_indices)
+                    output_ends_at_match = resume_state is not None and len(
+                        existing_output
+                    ) == len(resume_state.done_indices)
+                    is_fresh_file = (
+                        resume_state is None
+                        and output_path is not None
+                        and (
+                            not output_path.exists() or output_path.stat().st_size == 0
+                        )
+                    )
+                    # For a fresh file, only use incremental if every row
+                    # is pending (no interleaved already-done rows that
+                    # would need to be written in order).
+                    all_rows_pending = len(pending) == len(rows)
+                    use_incremental = (
+                        can_append
+                        and not multiple
+                        and (
+                            (
+                                resume_state is not None
+                                and resume_state.done_indices
+                                and not has_gaps
+                                and output_ends_at_match
+                            )
+                            or (is_fresh_file and all_rows_pending)
+                        )
+                    )
+
+                    if use_incremental:
+                        failed = _run_map_batches_incremental(
+                            context,
+                            pending,
+                            worker,
+                            prompt_text,
+                            target_column,
+                            few_shot_examples,
+                            multiple,
+                            batch_size,
+                            max_chars,
+                            parallel,
+                            err_path,
+                            output_path,
+                            fieldnames,
+                            wal_path,
+                            verbose,
+                        )
+                    else:
+                        failed = _run_map_batches(
+                            pending,
+                            worker,
+                            prompt_text,
+                            target_column,
+                            few_shot_examples,
+                            multiple,
+                            batch_size,
+                            max_chars,
+                            parallel,
+                            err_path,
+                            verbose,
+                            wal_path=wal_path,
+                        )
+
                     if failed:
                         click.echo(
                             f"Warning: {failed} batches failed"
                             + (
-                                f"; see {err_path} — rerun with --repair"
-                                if err_path
-                                else ""
+                                f"; see {err_path} — rerun to retry" if err_path else ""
                             ),
                             err=True,
                         )
@@ -559,17 +669,36 @@ class MapProcessor:
             if multiple:
                 rows = _expand_multiple_rows(rows, target_column, processed_indices)
 
-            write_output = _output_writer(context, output_path, out_fmt)
-            write_output(rows, fieldnames)
-            click.echo(
-                f"Wrote {len(rows)} rows"
-                + (f" to {output_path}" if output_path else ""),
-                err=True,
+            # Write final output.
+            # If we used incremental append, rows were already appended to
+            # the output file — just clean up the WAL.
+            # Otherwise, write the full output now.
+            did_incremental = (
+                not deterministic and processed_indices and use_incremental
             )
-            if not deterministic and pending:
-                pending_rows = [row for _, row in pending]
-                n_batches = len(_prepare_batches(pending_rows, batch_size, max_chars))
-                _echo_log_tip(n_batches)
+
+            if did_incremental:
+                _delete_wal(wal_path)
+                click.echo(f"Wrote {len(rows)} rows to {output_path}", err=True)
+            elif output_path is not None:
+                _write_via_temp_swap(context, output_path, out_fmt, rows, fieldnames)
+                _delete_wal(wal_path)
+                click.echo(f"Wrote {len(rows)} rows to {output_path}", err=True)
+            else:
+                write_output = _output_writer(context, output_path, out_fmt)
+                write_output(rows, fieldnames)
+                _delete_wal(wal_path)
+                click.echo(f"Wrote {len(rows)} rows", err=True)
+
+            if not deterministic and processed_indices:
+                pending_rows = [
+                    row for i, row in enumerate(rows) if i in processed_indices
+                ]
+                if pending_rows:
+                    n_batches = len(
+                        _prepare_batches(pending_rows, batch_size, max_chars)
+                    )
+                    _echo_log_tip(n_batches)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +757,9 @@ class ReduceProcessor:
             help="Concurrent groups",
         )
         @click.option(
-            "--repair", is_flag=True, help="Retry failed groups from the .err sidecar"
+            "--force",
+            is_flag=True,
+            help="Overwrite existing output file even if it doesn't match",
         )
         @click.option(
             "--err",
@@ -656,7 +787,7 @@ class ReduceProcessor:
             group_key_column: str,
             max_chars: int,
             parallel: int,
-            repair: bool,
+            force: bool,
             err_file: Optional[Path],
             dry_run: bool,
             verbose: bool,
@@ -674,6 +805,7 @@ class ReduceProcessor:
                 input_path, output, format_, input_format, output_format
             )
             err_path = err_file if err_file is not None else _err_path_for(output)
+            wal_path = _wal_path_for(output)
 
             with _open_input(context, input_path, in_fmt) as stream:
                 rows, fieldnames = _materialize(stream)
@@ -692,48 +824,54 @@ class ReduceProcessor:
             if limit is not None:
                 groups = dict(list(groups.items())[:limit])
 
-            if repair:
-                if err_path is None:
-                    raise click.UsageError("--repair requires --output or --err")
-                if output is None:
-                    raise click.UsageError(
-                        "--repair requires --output to merge results"
+            # --- Resume: load existing output + WAL ---
+            resume_state: Optional[ReduceResumeState] = None
+            existing_results: List[Dict[str, Any]] = []
+
+            if output and output.exists() and output.stat().st_size > 0 and not force:
+                try:
+                    output_input_plugin = context.inputs.for_path(output)
+                    with output_input_plugin.open(output) as out_stream:
+                        existing_results, _ = _materialize(out_stream)
+                except Exception:
+                    existing_results = []
+
+                if existing_results:
+                    resume_state = _match_reduce_output(
+                        existing_results, group_key_column, result_column
                     )
-                _reduce_repair(
-                    context,
-                    output,
-                    err_path,
-                    groups,
-                    instruction,
-                    group_by,
-                    result_column,
-                    group_key_column,
-                    worker_model or model,
-                    max_chars,
-                    parallel,
-                )
-                return
+                    if wal_path:
+                        for rec in _read_wal(wal_path):
+                            key = rec.get("g")
+                            if key is not None:
+                                resume_state.done_keys.add(str(key))
+                                resume_state.done_rows.append(
+                                    {group_key_column: key, result_column: rec["v"]}
+                                )
 
             deterministic = None
             prompt_text = instruction
             if mode == "expression":
                 deterministic = _compile_reduce_expression(instruction)
             elif mode == "interactive":
-                sample_group = next(iter(groups.values()), [])
-                plan = _interactive_plan_reduce(
-                    instruction,
-                    result_column,
-                    fieldnames,
-                    planning_model,
-                    model,
-                    sample_group,
-                )
-                if plan is None:
-                    raise SystemExit(0)
-                elif isinstance(plan, str):
-                    prompt_text = plan
+                if resume_state and resume_state.done_keys:
+                    prompt_text = instruction
                 else:
-                    deterministic = plan
+                    sample_group = next(iter(groups.values()), [])
+                    plan = _interactive_plan_reduce(
+                        instruction,
+                        result_column,
+                        fieldnames,
+                        planning_model,
+                        model,
+                        sample_group,
+                    )
+                    if plan is None:
+                        raise SystemExit(0)
+                    elif isinstance(plan, str):
+                        prompt_text = plan
+                    else:
+                        deterministic = plan
 
             if deterministic:
                 results: List[Dict[str, Any]] = []
@@ -750,55 +888,88 @@ class ReduceProcessor:
                 worker = _resolve_worker_model(model, worker_model)
                 _require_schema_support(worker)
 
-                group_items = list(groups.items())
+                # Filter out already-done groups
+                if resume_state:
+                    pending_groups = [
+                        (k, v)
+                        for k, v in groups.items()
+                        if str(k) not in resume_state.done_keys
+                    ]
+                else:
+                    pending_groups = list(groups.items())
 
-                if dry_run:
-                    _dry_run_reduce(
-                        group_items,
+                if not pending_groups:
+                    click.echo(
+                        "No groups required LLM processing; nothing to do", err=True
+                    )
+                    results = existing_results if existing_results else []
+                    _delete_wal(wal_path)
+                else:
+                    if dry_run:
+                        _dry_run_reduce(
+                            pending_groups,
+                            prompt_text,
+                            group_by,
+                            max_chars,
+                            result_column,
+                        )
+                        return
+
+                    click.echo(
+                        f"Reducing {len(pending_groups)} groups (parallel={parallel})",
+                        err=True,
+                    )
+                    _clear_err_file(err_path)
+                    new_results, failed = _run_reduce_groups(
+                        pending_groups,
+                        worker,
                         prompt_text,
                         group_by,
                         max_chars,
                         result_column,
+                        group_key_column,
+                        parallel,
+                        err_path,
+                        verbose,
+                        wal_path=wal_path,
                     )
-                    return
+                    if failed:
+                        click.echo(
+                            f"Warning: {failed}/{len(pending_groups)} groups failed"
+                            + (
+                                f"; see {err_path} — rerun to retry" if err_path else ""
+                            ),
+                            err=True,
+                        )
 
-                click.echo(
-                    f"Reducing {len(group_items)} groups (parallel={parallel})",
-                    err=True,
-                )
-                _clear_err_file(err_path)
-                results, failed = _run_reduce_groups(
-                    group_items,
-                    worker,
-                    prompt_text,
-                    group_by,
-                    max_chars,
-                    result_column,
-                    group_key_column,
-                    parallel,
-                    err_path,
-                    verbose,
-                )
-                if failed:
-                    click.echo(
-                        f"Warning: {failed}/{len(group_items)} groups failed"
-                        + (
-                            f"; see {err_path} — rerun with --repair"
-                            if err_path
-                            else ""
-                        ),
-                        err=True,
-                    )
+                    # Merge with existing results
+                    if resume_state and existing_results:
+                        done_keys = {
+                            str(r.get(group_key_column)) for r in existing_results
+                        }
+                        results = list(existing_results)
+                        for r in new_results:
+                            if str(r.get(group_key_column)) not in done_keys:
+                                results.append(r)
+                    else:
+                        results = new_results
 
-            write_output = _output_writer(context, output, out_fmt)
-            write_output(results, [group_key_column, result_column])
+            result_fieldnames = [group_key_column, result_column]
+            if output is not None:
+                _write_via_temp_swap(
+                    context, output, out_fmt, results, result_fieldnames
+                )
+            else:
+                write_output = _output_writer(context, output, out_fmt)
+                write_output(results, result_fieldnames)
+            _delete_wal(wal_path)
             click.echo(
                 f"Wrote {len(results)} group results"
                 + (f" to {output}" if output else ""),
                 err=True,
             )
-            if not deterministic:
-                _echo_log_tip(len(group_items))
+            if not deterministic and pending_groups:
+                _echo_log_tip(len(pending_groups))
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +1012,18 @@ class FilterProcessor:
             show_default=True,
             help="Concurrent batches",
         )
+        @click.option(
+            "--force",
+            is_flag=True,
+            help="Overwrite existing output file even if it doesn't match",
+        )
+        @click.option(
+            "--err",
+            "err_file",
+            type=click.Path(dir_okay=False, path_type=Path),
+            default=None,
+            help="Error sidecar path (default: <output>.err)",
+        )
         def filter_command(
             input_path: Optional[Path],
             instruction: str,
@@ -858,6 +1041,8 @@ class FilterProcessor:
             batch_size: int,
             max_chars: int,
             parallel: int,
+            force: bool,
+            err_file: Optional[Path],
             dry_run: bool,
             verbose: bool,
         ) -> None:
@@ -868,6 +1053,8 @@ class FilterProcessor:
             in_fmt, out_fmt = _resolve_formats(
                 input_path, output, format_, input_format, output_format
             )
+            err_path = err_file if err_file is not None else _err_path_for(output)
+            wal_path = _wal_path_for(output)
 
             parsed_filters = [parse_filter(expr) for expr in filters]
 
@@ -897,22 +1084,54 @@ class FilterProcessor:
 
             rows = filter_rows(rows, parsed_filters)
 
+            # --- Resume: load existing output + WAL + .err ---
+            resume_state: Optional[FilterResumeState] = None
+
+            if output and output.exists() and output.stat().st_size > 0 and not force:
+                try:
+                    output_input_plugin = context.inputs.for_path(output)
+                    with output_input_plugin.open(output) as out_stream:
+                        existing_output, _ = _materialize(out_stream)
+                except Exception:
+                    existing_output = []
+
+                if existing_output:
+                    err_records = _read_errors(err_path) if err_path else []
+                    wal_records = _read_wal(wal_path) if wal_path else []
+
+                    resume_state = _match_filter_output(
+                        rows, existing_output, err_records
+                    )
+
+                    # Incorporate WAL records
+                    for rec in wal_records:
+                        idx = rec["i"]
+                        if rec.get("kept"):
+                            resume_state.done_indices.add(idx)
+                            resume_state.kept_indices.add(idx)
+                        else:
+                            resume_state.done_indices.add(idx)
+                            resume_state.filtered_out_indices.add(idx)
+
             deterministic = None
             prompt_text = instruction
             if mode == "interactive":
-                plan = _interactive_plan_filter(
-                    instruction,
-                    fieldnames,
-                    planning_model,
-                    model,
-                    rows[:3],
-                )
-                if plan is None:
-                    raise SystemExit(0)
-                elif isinstance(plan, str):
-                    prompt_text = plan
+                if resume_state and resume_state.done_indices:
+                    prompt_text = instruction
                 else:
-                    deterministic = plan
+                    plan = _interactive_plan_filter(
+                        instruction,
+                        fieldnames,
+                        planning_model,
+                        model,
+                        rows[:3],
+                    )
+                    if plan is None:
+                        raise SystemExit(0)
+                    elif isinstance(plan, str):
+                        prompt_text = plan
+                    else:
+                        deterministic = plan
 
             if deterministic:
                 kept = [row for row in rows if deterministic.evaluate(row)]
@@ -920,29 +1139,78 @@ class FilterProcessor:
                 worker = _resolve_worker_model(model, worker_model)
                 _require_schema_support(worker)
 
-                if dry_run:
-                    _dry_run_filter(rows, prompt_text, batch_size, max_chars)
-                    return
+                # Filter out already-done rows
+                if resume_state:
+                    pending_rows = [
+                        row
+                        for i, row in enumerate(rows)
+                        if i not in resume_state.done_indices
+                    ]
+                    pending_indices = [
+                        i
+                        for i in range(len(rows))
+                        if i not in resume_state.done_indices
+                    ]
+                else:
+                    pending_rows = rows
+                    pending_indices = list(range(len(rows)))
 
-                kept = _run_filter_llm(
-                    rows,
-                    worker,
-                    prompt_text,
-                    batch_size,
-                    max_chars,
-                    parallel,
-                    verbose,
-                )
+                if not pending_rows:
+                    click.echo(
+                        "No rows required LLM processing; nothing to do", err=True
+                    )
+                    kept = (
+                        [rows[i] for i in sorted(resume_state.kept_indices)]
+                        if resume_state
+                        else []
+                    )
+                    _delete_wal(wal_path)
+                else:
+                    if dry_run:
+                        _dry_run_filter(
+                            pending_rows, prompt_text, batch_size, max_chars
+                        )
+                        return
 
-            write_output = _output_writer(context, output, out_fmt)
-            write_output(kept, fieldnames)
+                    _clear_err_file(err_path)
+
+                    new_kept = _run_filter_llm(
+                        pending_rows,
+                        worker,
+                        prompt_text,
+                        batch_size,
+                        max_chars,
+                        parallel,
+                        verbose,
+                        err_path=err_path,
+                        row_indices=pending_indices,
+                        wal_path=wal_path,
+                    )
+
+                    # Merge with already-kept rows from resume
+                    if resume_state:
+                        kept_set = set(resume_state.kept_indices)
+                        new_kept_set = {id(r) for r in new_kept}
+                        for i, row in enumerate(pending_rows):
+                            if id(row) in new_kept_set:
+                                kept_set.add(pending_indices[i])
+                        kept = [rows[i] for i in sorted(kept_set)]
+                    else:
+                        kept = new_kept
+
+            if output is not None:
+                _write_via_temp_swap(context, output, out_fmt, kept, fieldnames)
+            else:
+                write_output = _output_writer(context, output, out_fmt)
+                write_output(kept, fieldnames)
+            _delete_wal(wal_path)
             click.echo(
                 f"Kept {len(kept)}/{len(rows)} rows"
                 + (f" → {output}" if output else ""),
                 err=True,
             )
-            if not deterministic:
-                n_batches = len(_prepare_batches(rows, batch_size, max_chars))
+            if not deterministic and pending_rows:
+                n_batches = len(_prepare_batches(pending_rows, batch_size, max_chars))
                 _echo_log_tip(n_batches)
 
 
@@ -1204,9 +1472,21 @@ def _run_filter_llm(
     max_chars: int,
     parallel: int,
     verbose: bool = False,
+    err_path: Optional[Path] = None,
+    row_indices: Optional[List[int]] = None,
+    wal_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """Classify each row with the LLM and keep rows where result is truthy."""
     batches = _prepare_batches(rows, batch_size, max_chars)
+
+    if row_indices is None:
+        row_indices = list(range(len(rows)))
+
+    idx_offset = 0
+    index_batches: List[List[int]] = []
+    for batch in batches:
+        index_batches.append(row_indices[idx_offset : idx_offset + len(batch)])
+        idx_offset += len(batch)
 
     def _process_one(batch):
         prompt_text = _build_filter_prompt(instruction, batch)
@@ -1218,23 +1498,44 @@ def _run_filter_llm(
 
     results: List[bool] = []
     if parallel == 1:
-        for i, batch in enumerate(batches):
-            verdicts = _process_one(batch)
+        for i, (batch, indices) in enumerate(zip(batches, index_batches)):
+            try:
+                verdicts = _process_one(batch)
+            except Exception as exc:
+                _append_error(err_path, {"row_indices": indices, "error": str(exc)})
+                results.extend([False] * len(batch))
+                click.echo(f"  Batch {i + 1}/{len(batches)} failed: {exc}", err=True)
+                continue
             results.extend(verdicts)
+            if wal_path:
+                for idx, kept in zip(indices, verdicts):
+                    _append_wal(wal_path, {"i": idx, "kept": kept})
             click.echo(f"  Filtered batch {i + 1}/{len(batches)}", err=True)
     else:
         batch_verdicts: Dict[int, List[bool]] = {}
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = {
-                executor.submit(_process_one, batch): i
-                for i, batch in enumerate(batches)
+                executor.submit(_process_one, batch): (i, indices)
+                for i, (batch, indices) in enumerate(zip(batches, index_batches))
             }
             for future in as_completed(futures):
-                idx = futures[future]
-                batch_verdicts[idx] = future.result()
+                idx, indices = futures[future]
+                try:
+                    verdicts = future.result()
+                    batch_verdicts[idx] = verdicts
+                except Exception as exc:
+                    _append_error(err_path, {"row_indices": indices, "error": str(exc)})
+                    batch_verdicts[idx] = [False] * len(indices)
+                    click.echo(
+                        f"  Batch {idx + 1}/{len(batches)} failed: {exc}", err=True
+                    )
+                    continue
+                if wal_path:
+                    for row_idx, kept in zip(indices, verdicts):
+                        _append_wal(wal_path, {"i": row_idx, "kept": kept})
                 click.echo(f"  Filtered batch {idx + 1}/{len(batches)}", err=True)
         for i in range(len(batches)):
-            results.extend(batch_verdicts[i])
+            results.extend(batch_verdicts.get(i, [False] * len(batches[i])))
 
     return [row for row, keep in zip(rows, results) if keep]
 
@@ -1320,6 +1621,7 @@ def _run_reduce_groups(
     parallel: int,
     err_path: Path,
     verbose: bool = False,
+    wal_path: Optional[Path] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     def _reduce_one(group_key, group_rows):
         value = _reduce_rows(
@@ -1333,7 +1635,8 @@ def _run_reduce_groups(
     if parallel == 1:
         for i, (group_key, group_rows) in enumerate(group_items):
             try:
-                results.append(_reduce_one(group_key, group_rows))
+                result = _reduce_one(group_key, group_rows)
+                results.append(result)
             except Exception as exc:
                 failed += 1
                 _append_error(err_path, {"group_key": group_key, "error": str(exc)})
@@ -1341,6 +1644,11 @@ def _run_reduce_groups(
                     f"  Group {i + 1}/{len(group_items)} failed: {exc}", err=True
                 )
                 continue
+            if wal_path:
+                _append_wal(
+                    wal_path,
+                    {"g": group_key, "c": result_column, "v": result[result_column]},
+                )
             click.echo(f"  Completed group {i + 1}/{len(group_items)}", err=True)
     else:
         with ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -1352,7 +1660,8 @@ def _run_reduce_groups(
             for future in as_completed(futures):
                 group_idx, group_key = futures[future]
                 try:
-                    results.append(future.result())
+                    result = future.result()
+                    results.append(result)
                 except Exception as exc:
                     failed += 1
                     _append_error(err_path, {"group_key": group_key, "error": str(exc)})
@@ -1361,76 +1670,21 @@ def _run_reduce_groups(
                         err=True,
                     )
                     continue
+                if wal_path:
+                    _append_wal(
+                        wal_path,
+                        {
+                            "g": group_key,
+                            "c": result_column,
+                            "v": result[result_column],
+                        },
+                    )
                 completed += 1
                 click.echo(
                     f"  Completed group {completed}/{len(group_items)}", err=True
                 )
 
     return results, failed
-
-
-def _reduce_repair(
-    context: PluginContext,
-    output: Path,
-    err_path: Path,
-    groups: Dict[str, List[Dict[str, Any]]],
-    prompt: str,
-    group_by: Sequence[str],
-    result_column: str,
-    group_key_column: str,
-    model: Optional[str],
-    max_chars: int,
-    parallel: int,
-) -> None:
-    error_records = _read_errors(err_path)
-    if not error_records:
-        click.echo("No errors to repair; nothing to do", err=True)
-        return
-
-    failed_keys = {r["group_key"] for r in error_records}
-    pending_groups = [(k, v) for k, v in groups.items() if k in failed_keys]
-
-    if not pending_groups:
-        click.echo("No matching groups to repair", err=True)
-        _clear_err_file(err_path)
-        return
-
-    existing_results: List[Dict[str, Any]] = []
-    if output.exists():
-        try:
-            output_input_plugin = context.inputs.for_path(output)
-            with output_input_plugin.open(output) as stream:
-                existing_rows, _ = _materialize(stream)
-            existing_results = list(existing_rows)
-        except Exception:
-            pass
-
-    model_obj = resolve_model(model)
-    _require_schema_support(model_obj)
-
-    _clear_err_file(err_path)
-    click.echo(
-        f"Repairing {len(pending_groups)} groups (parallel={parallel})", err=True
-    )
-    new_results, failed = _run_reduce_groups(
-        pending_groups,
-        model_obj,
-        prompt,
-        group_by,
-        max_chars,
-        result_column,
-        group_key_column,
-        parallel,
-        err_path,
-    )
-
-    if failed:
-        click.echo(f"Warning: {failed} groups still failing; see {err_path}", err=True)
-
-    merged = existing_results + new_results
-    output_plugin = context.outputs.for_path(output)
-    output_plugin.write(output, merged, [group_key_column, result_column])
-    click.echo(f"Wrote {len(merged)} group results to {output}", err=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1486,6 +1740,297 @@ def _err_path_for(output_path: Optional[Path]) -> Optional[Path]:
     return Path(str(output_path) + ".err")
 
 
+def _wal_path_for(output_path: Optional[Path]) -> Optional[Path]:
+    if output_path is None:
+        return None
+    return Path(str(output_path) + ".wal")
+
+
+# ---------------------------------------------------------------------------
+# WAL (write-ahead log) infrastructure
+# ---------------------------------------------------------------------------
+
+
+def _append_wal(wal_path: Path, record: Dict[str, Any]) -> None:
+    with wal_path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _read_wal(wal_path: Path) -> List[Dict[str, Any]]:
+    if not wal_path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    with wal_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def _delete_wal(wal_path: Optional[Path]) -> None:
+    if wal_path is not None and wal_path.exists():
+        wal_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Resume: superset matching
+# ---------------------------------------------------------------------------
+
+
+def _is_superset(output_row: Dict[str, Any], input_row: Dict[str, Any]) -> bool:
+    """True if output_row contains all key-value pairs from input_row.
+
+    Compares by native equality first so that typed formats (JSONL) don't
+    conflate e.g. 1 (int) with "1" (str).  Falls back to str() coercion
+    only when exactly one side is a string and the other isn't — this
+    handles the case where a typed input (e.g. JSONL with int 1) is
+    compared against an output that was read back from CSV (where all
+    values become strings, so int 1 becomes "1").
+    """
+    for key, value in input_row.items():
+        if key not in output_row:
+            return False
+        out_val = output_row[key]
+        if out_val == value:
+            continue
+        if out_val is None or value is None:
+            return False
+        if isinstance(out_val, str) != isinstance(value, str):
+            if str(out_val) == str(value):
+                continue
+        return False
+    return True
+
+
+@dataclass
+class MapResumeState:
+    """Result of walking input + output to determine resume state for map."""
+
+    done_indices: Set[int] = field(default_factory=set)
+    done_rows: List[Dict[str, Any]] = field(default_factory=list)
+    gap_indices: List[int] = field(default_factory=list)
+    tail_start: int = 0
+    last_match_index: int = -1
+    output_rows: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _match_map_output(
+    input_rows: List[Dict[str, Any]],
+    output_rows: List[Dict[str, Any]],
+    target_column: str,
+    multiple: bool = False,
+) -> MapResumeState:
+    """Walk input and output in tandem using superset matching for map resume.
+
+    Returns a MapResumeState with done/gap/tail classification.
+    """
+    state = MapResumeState(output_rows=output_rows)
+    out_idx = 0
+
+    for in_idx, in_row in enumerate(input_rows):
+        if out_idx >= len(output_rows):
+            break
+
+        out_row = output_rows[out_idx]
+        if _is_superset(out_row, in_row) and _has_value(out_row.get(target_column)):
+            state.done_indices.add(in_idx)
+            state.done_rows.append(out_row)
+            state.last_match_index = in_idx
+            out_idx += 1
+
+            if multiple:
+                while out_idx < len(output_rows) and _is_superset(
+                    output_rows[out_idx], in_row
+                ):
+                    state.done_rows.append(output_rows[out_idx])
+                    out_idx += 1
+        else:
+            pass
+
+    for in_idx in range(len(input_rows)):
+        if in_idx not in state.done_indices and in_idx <= state.last_match_index:
+            state.gap_indices.append(in_idx)
+
+    state.tail_start = state.last_match_index + 1
+    return state
+
+
+@dataclass
+class ReduceResumeState:
+    done_keys: Set[str] = field(default_factory=set)
+    done_rows: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _match_reduce_output(
+    output_rows: List[Dict[str, Any]],
+    group_key_column: str,
+    result_column: str,
+) -> ReduceResumeState:
+    """Match existing reduce output by group key."""
+    state = ReduceResumeState()
+    for row in output_rows:
+        key = row.get(group_key_column)
+        if key is not None and _has_value(row.get(result_column)):
+            state.done_keys.add(str(key))
+            state.done_rows.append(row)
+    return state
+
+
+@dataclass
+class FilterResumeState:
+    done_indices: Set[int] = field(default_factory=set)
+    kept_indices: Set[int] = field(default_factory=set)
+    filtered_out_indices: Set[int] = field(default_factory=set)
+    errored_indices: Set[int] = field(default_factory=set)
+    output_rows: List[Dict[str, Any]] = field(default_factory=list)
+    last_match_input_index: int = -1
+
+
+def _match_filter_output(
+    input_rows: List[Dict[str, Any]],
+    output_rows: List[Dict[str, Any]],
+    err_records: List[Dict[str, Any]],
+) -> FilterResumeState:
+    """Walk input and output for filter resume.
+
+    Uses .err to distinguish 'filtered out' from 'errored' for rows
+    before the last match.
+    """
+    state = FilterResumeState(output_rows=output_rows)
+
+    errored_indices: Set[int] = set()
+    for record in err_records:
+        for idx in record.get("row_indices", []):
+            errored_indices.add(idx)
+    state.errored_indices = errored_indices
+
+    out_idx = 0
+    for in_idx, in_row in enumerate(input_rows):
+        if out_idx < len(output_rows):
+            out_row = output_rows[out_idx]
+            if out_row == in_row or _is_superset(out_row, in_row):
+                state.done_indices.add(in_idx)
+                state.kept_indices.add(in_idx)
+                state.last_match_input_index = in_idx
+                out_idx += 1
+                continue
+
+    for in_idx in range(len(input_rows)):
+        if in_idx in state.done_indices:
+            continue
+        if in_idx <= state.last_match_input_index:
+            if in_idx in errored_indices:
+                pass
+            else:
+                state.filtered_out_indices.add(in_idx)
+                state.done_indices.add(in_idx)
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Reorder buffer for parallel output ordering
+# ---------------------------------------------------------------------------
+
+
+class ReorderBuffer:
+    """Buffers out-of-order batch results and flushes them in input order.
+
+    Used when parallel > 1 to maintain input ordering in the output.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buffer: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+        self._next_flush_index: int = 0
+
+    def add_batch(
+        self, batch_index: int, rows: List[Tuple[int, Dict[str, Any]]]
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        """Add a completed batch and return rows ready to flush (in order).
+
+        Returns rows that can be flushed now (contiguous from next_flush_index).
+        """
+        with self._lock:
+            self._buffer[batch_index] = rows
+            ready: List[Tuple[int, Dict[str, Any]]] = []
+            while self._next_flush_index in self._buffer:
+                ready.extend(self._buffer.pop(self._next_flush_index))
+                self._next_flush_index += 1
+            return ready
+
+    def drain(self) -> List[Tuple[int, Dict[str, Any]]]:
+        """Return all buffered rows (for WAL flush on interrupt)."""
+        with self._lock:
+            all_rows: List[Tuple[int, Dict[str, Any]]] = []
+            for batch_idx in sorted(self._buffer.keys()):
+                all_rows.extend(self._buffer[batch_idx])
+            self._buffer.clear()
+            return all_rows
+
+
+# ---------------------------------------------------------------------------
+# Merge helpers
+# ---------------------------------------------------------------------------
+
+
+def _merge_map_output(
+    input_rows: List[Dict[str, Any]],
+    existing_output: List[Dict[str, Any]],
+    wal_records: List[Dict[str, Any]],
+    target_column: str,
+    fieldnames: List[str],
+    multiple: bool = False,
+) -> List[Dict[str, Any]]:
+    """Merge input rows with existing output and WAL records for map.
+
+    Builds the complete output by combining:
+    - Existing output rows (already matched)
+    - WAL records (gap fills)
+    - Input rows (for any remaining)
+    """
+    wal_by_index: Dict[int, Any] = {}
+    for record in wal_records:
+        wal_by_index[record["i"]] = record["v"]
+
+    resume_state = _match_map_output(
+        input_rows, existing_output, target_column, multiple
+    )
+
+    merged: List[Dict[str, Any]] = []
+    out_idx = 0
+
+    for in_idx, in_row in enumerate(input_rows):
+        if in_idx in resume_state.done_indices:
+            merged.append(existing_output[out_idx])
+            out_idx += 1
+            if multiple:
+                while out_idx < len(existing_output) and _is_superset(
+                    existing_output[out_idx], in_row
+                ):
+                    merged.append(existing_output[out_idx])
+                    out_idx += 1
+        elif in_idx in wal_by_index:
+            row = dict(in_row)
+            row[target_column] = wal_by_index[in_idx]
+            if multiple and isinstance(row[target_column], list):
+                for item in row[target_column]:
+                    new_row = dict(in_row)
+                    new_row[target_column] = item
+                    merged.append(new_row)
+            else:
+                merged.append(row)
+        else:
+            merged.append(dict(in_row))
+
+    return merged
+
+
 def _clear_err_file(err_path: Optional[Path]) -> None:
     if err_path is not None and err_path.exists():
         err_path.unlink()
@@ -1507,8 +2052,12 @@ def _read_errors(err_path: Path) -> List[Dict[str, Any]]:
     with err_path.open("r", encoding="utf-8") as fp:
         for line in fp:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return records
 
 
@@ -1587,6 +2136,7 @@ def _run_map_batches(
     parallel: int,
     err_path: Path,
     verbose: bool = False,
+    wal_path: Optional[Path] = None,
 ) -> int:
     pending_indices = [i for i, _ in pending]
     pending_rows = [row for _, row in pending]
@@ -1617,6 +2167,12 @@ def _run_map_batches(
                 _append_error(err_path, {"row_indices": indices, "error": str(exc)})
                 click.echo(f"  Batch {i + 1}/{len(batches)} failed: {exc}", err=True)
                 continue
+            if wal_path:
+                for idx, row in zip(indices, batch):
+                    _append_wal(
+                        wal_path,
+                        {"i": idx, "c": target_column, "v": row.get(target_column)},
+                    )
             click.echo(f"  Completed batch {i + 1}/{len(batches)}", err=True)
     else:
         with ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -1630,12 +2186,12 @@ def _run_map_batches(
                     few_shot_examples,
                     multiple,
                     verbose,
-                ): (i, indices)
+                ): (i, indices, batch)
                 for i, (batch, indices) in enumerate(zip(batches, index_batches))
             }
             completed = 0
             for future in as_completed(futures):
-                batch_idx, indices = futures[future]
+                batch_idx, indices, batch = futures[future]
                 try:
                     future.result()
                 except Exception as exc:
@@ -1646,77 +2202,184 @@ def _run_map_batches(
                         err=True,
                     )
                     continue
+                if wal_path:
+                    for idx, row in zip(indices, batch):
+                        _append_wal(
+                            wal_path,
+                            {
+                                "i": idx,
+                                "c": target_column,
+                                "v": row.get(target_column),
+                            },
+                        )
                 completed += 1
                 click.echo(f"  Completed batch {completed}/{len(batches)}", err=True)
     return failed
 
 
-def _map_repair(
+def _run_map_batches_incremental(
     context: PluginContext,
-    output_path: Path,
-    err_path: Path,
+    pending: List[Tuple[int, Dict[str, Any]]],
+    model_obj,
     prompt: str,
     target_column: str,
+    few_shot_examples: Sequence[Tuple[Dict[str, Any], Any]],
+    multiple: bool,
     batch_size: int,
     max_chars: int,
-    few_shot: int,
-    model: Optional[str],
-    multiple: bool,
     parallel: int,
-) -> None:
-    error_records = _read_errors(err_path)
-    if not error_records:
-        click.echo("No errors to repair; nothing to do", err=True)
-        return
+    err_path: Optional[Path],
+    output_path: Path,
+    fieldnames: List[str],
+    wal_path: Optional[Path],
+    verbose: bool = False,
+) -> int:
+    """Run map batches with incremental append to the output file.
 
-    if not output_path.exists():
-        raise click.ClickException(
-            f"Output file {output_path} does not exist. Run without --repair first."
-        )
+    Rows are written to the output file as each batch completes, using
+    a reorder buffer to maintain input ordering when parallel > 1.
+    """
+    pending_indices = [i for i, _ in pending]
+    pending_rows = [row for _, row in pending]
+    batches = _prepare_batches(pending_rows, batch_size, max_chars)
 
-    output_input_plugin = context.inputs.for_path(output_path)
-    with output_input_plugin.open(output_path) as stream:
-        rows, fieldnames = _materialize(stream)
+    idx_offset = 0
+    index_batches: List[List[int]] = []
+    for batch in batches:
+        index_batches.append(pending_indices[idx_offset : idx_offset + len(batch)])
+        idx_offset += len(batch)
 
-    failed_indices = set()
-    for record in error_records:
-        failed_indices.update(record.get("row_indices", []))
-
-    pending = [(i, rows[i]) for i in sorted(failed_indices) if i < len(rows)]
-    if not pending:
-        click.echo("No rows to repair", err=True)
-        _clear_err_file(err_path)
-        return
-
-    processed_indices = {i for i, _ in pending}
-
-    model_obj = resolve_model(model)
-    _require_schema_support(model_obj)
-
-    few_shot_examples = _extract_few_shot_examples(rows, target_column, few_shot)
-    _clear_err_file(err_path)
-    click.echo(f"Repairing {len(pending)} rows", err=True)
-    failed = _run_map_batches(
-        pending,
-        model_obj,
-        prompt,
-        target_column,
-        few_shot_examples,
-        multiple,
-        batch_size,
-        max_chars,
-        parallel,
-        err_path,
-    )
-    if failed:
-        click.echo(f"Warning: {failed} batches still failing; see {err_path}", err=True)
-
-    if multiple:
-        rows = _expand_multiple_rows(rows, target_column, processed_indices)
+    click.echo(f"Processing {len(batches)} batches (parallel={parallel})", err=True)
 
     output_plugin = context.outputs.for_path(output_path)
-    output_plugin.write(output_path, rows, fieldnames)
-    click.echo(f"Wrote {len(rows)} rows to {output_path}", err=True)
+    assert isinstance(output_plugin, AppendableOutput)
+
+    reorder = ReorderBuffer()
+    failed = 0
+
+    with output_plugin.open_append(output_path, fieldnames) as appender:
+
+        def _flush_rows(rows_to_flush: List[Tuple[int, Dict[str, Any]]]) -> None:
+            for _, row in rows_to_flush:
+                appender.append(row)
+            appender.flush()
+
+        if parallel == 1:
+            for batch_num, (batch, indices) in enumerate(zip(batches, index_batches)):
+                batch_failed = False
+                try:
+                    _process_batch(
+                        model_obj,
+                        prompt,
+                        target_column,
+                        batch,
+                        few_shot_examples,
+                        multiple,
+                        verbose,
+                    )
+                except Exception as exc:
+                    batch_failed = True
+                    failed += 1
+                    _append_error(err_path, {"row_indices": indices, "error": str(exc)})
+                    click.echo(
+                        f"  Batch {batch_num + 1}/{len(batches)} failed: {exc}",
+                        err=True,
+                    )
+                # Always add to reorder buffer so failed rows (with empty
+                # target column) are still written in order.
+                completed_rows = [(idx, row) for idx, row in zip(indices, batch)]
+                ready = reorder.add_batch(batch_num, completed_rows)
+                _flush_rows(ready)
+                if not batch_failed:
+                    click.echo(
+                        f"  Completed batch {batch_num + 1}/{len(batches)}", err=True
+                    )
+        else:
+            with ThreadPoolExecutor(max_workers=parallel) as executor:
+                futures = {
+                    executor.submit(
+                        _process_batch,
+                        model_obj,
+                        prompt,
+                        target_column,
+                        batch,
+                        few_shot_examples,
+                        multiple,
+                        verbose,
+                    ): (batch_num, indices, batch)
+                    for batch_num, (batch, indices) in enumerate(
+                        zip(batches, index_batches)
+                    )
+                }
+                completed = 0
+                for future in as_completed(futures):
+                    batch_num, indices, batch = futures[future]
+                    batch_failed = False
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        batch_failed = True
+                        failed += 1
+                        _append_error(
+                            err_path,
+                            {"row_indices": indices, "error": str(exc)},
+                        )
+                        click.echo(
+                            f"  Batch {batch_num + 1}/{len(batches)} failed: {exc}",
+                            err=True,
+                        )
+                    completed_rows = [(idx, row) for idx, row in zip(indices, batch)]
+                    ready = reorder.add_batch(batch_num, completed_rows)
+                    _flush_rows(ready)
+                    if not batch_failed:
+                        completed += 1
+                        click.echo(
+                            f"  Completed batch {completed}/{len(batches)}",
+                            err=True,
+                        )
+
+                # Drain inside the executor context so it runs even if
+                # KeyboardInterrupt fires during as_completed iteration.
+                # NOTE: a true ctrl-c signal handler that flushes the
+                # reorder buffer to WAL before exit is not yet implemented;
+                # this only covers the normal-exit and exception-unwind
+                # paths.
+                remaining = reorder.drain()
+                if remaining and wal_path:
+                    for idx, row in remaining:
+                        _append_wal(
+                            wal_path,
+                            {
+                                "i": idx,
+                                "c": target_column,
+                                "v": row.get(target_column),
+                            },
+                        )
+
+    return failed
+
+
+def _write_via_temp_swap(
+    context: PluginContext,
+    output_path: Path,
+    out_fmt: str,
+    rows: List[Dict[str, Any]],
+    fieldnames: List[str],
+) -> None:
+    """Write rows to a temp file, then atomically swap over the output."""
+    suffix = output_path.suffix or ("." + out_fmt)
+    tmp = tempfile.NamedTemporaryFile(
+        dir=output_path.parent, suffix=suffix, delete=False
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        plugin = context.outputs.for_path(output_path)
+        plugin.write(tmp_path, rows, fieldnames)
+        tmp_path.replace(output_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _build_map_prompt(

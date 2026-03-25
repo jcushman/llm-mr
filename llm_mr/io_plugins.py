@@ -8,7 +8,7 @@ from typing import IO, Iterable, Iterator, Sequence
 
 from openpyxl import Workbook, load_workbook
 
-from .registries import InputRegistry, OutputRegistry, Row, TableStream
+from .registries import InputRegistry, OutputRegistry, Row, RowAppender, TableStream
 
 
 class CSVInputPlugin:
@@ -31,6 +31,18 @@ class CSVInputPlugin:
         return TableStream(rows=reader, fieldnames=fieldnames)
 
 
+class _CSVRowAppender:
+    def __init__(self, fp: IO[str], fieldnames: list):
+        self._fp = fp
+        self._writer = csv.DictWriter(fp, fieldnames=fieldnames)
+
+    def append(self, row: Row) -> None:
+        self._writer.writerow(row)
+
+    def flush(self) -> None:
+        self._fp.flush()
+
+
 class CSVOutputPlugin:
     name = "csv"
     extensions = [".csv"]
@@ -44,6 +56,22 @@ class CSVOutputPlugin:
         self, stream: IO[str], rows: Iterable[Row], fieldnames: Iterable[str]
     ) -> None:
         self._write_fp(stream, rows, list(fieldnames))
+
+    @contextmanager
+    def open_append(
+        self, path: Path, fieldnames: Sequence[str]
+    ) -> Iterator[RowAppender]:
+        field_list = list(fieldnames)
+        write_header = not path.exists() or path.stat().st_size == 0
+        fp = path.open("a", encoding="utf-8", newline="")
+        try:
+            if write_header and field_list:
+                writer = csv.DictWriter(fp, fieldnames=field_list)
+                writer.writeheader()
+                fp.flush()
+            yield _CSVRowAppender(fp, field_list)
+        finally:
+            fp.close()
 
     @staticmethod
     def _write_fp(fp: IO[str], rows: Iterable[Row], field_list: list) -> None:
@@ -90,6 +118,18 @@ class JSONLInputPlugin:
         return TableStream(rows=chain(), fieldnames=fieldnames)
 
 
+class _JSONLRowAppender:
+    def __init__(self, fp: IO[str]):
+        self._fp = fp
+
+    def append(self, row: Row) -> None:
+        self._fp.write(json.dumps(row, ensure_ascii=False))
+        self._fp.write("\n")
+
+    def flush(self) -> None:
+        self._fp.flush()
+
+
 class JSONLOutputPlugin:
     name = "jsonl"
     extensions = [".jsonl"]
@@ -102,6 +142,16 @@ class JSONLOutputPlugin:
         self, stream: IO[str], rows: Iterable[Row], fieldnames: Sequence[str]
     ) -> None:
         self._write_fp(stream, rows)
+
+    @contextmanager
+    def open_append(
+        self, path: Path, fieldnames: Sequence[str]
+    ) -> Iterator[RowAppender]:
+        fp = path.open("a", encoding="utf-8")
+        try:
+            yield _JSONLRowAppender(fp)
+        finally:
+            fp.close()
 
     @staticmethod
     def _write_fp(fp: IO[str], rows: Iterable[Row]) -> None:

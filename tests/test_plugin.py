@@ -445,15 +445,16 @@ def test_map_writes_err_file_on_failure(tmp_path):
         assert len(errors) == 1
         assert errors[0]["row_indices"] == [1]
         assert "Simulated API failure" in errors[0]["error"]
+
+        assert "rerun to retry" in result.output
     finally:
         pm.unregister(plugin=plugin)
 
 
-def test_map_repair_retries_failed_rows(tmp_path, mock_model):
-    """--repair reads the .err file, retries failed rows, updates the output."""
+def test_map_resume_skips_done_rows(tmp_path, mock_model):
+    """Re-running with existing output skips already-done rows."""
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
-    err_path = tmp_path / "output.csv.err"
 
     rows = [
         {"id": "1", "note": "alpha"},
@@ -467,8 +468,6 @@ def test_map_repair_retries_failed_rows(tmp_path, mock_model):
             {"id": "2", "note": "beta", "mr_result": ""},
         ],
     )
-    with err_path.open("w") as fp:
-        fp.write(json.dumps({"row_indices": [1], "error": "previous failure"}) + "\n")
 
     mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
 
@@ -486,18 +485,16 @@ def test_map_repair_retries_failed_rows(tmp_path, mock_model):
             str(output_path),
             "--model",
             "demo",
-            "--repair",
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Repairing 1 rows" in result.output
 
     written_rows = _read_csv(output_path)
     assert len(written_rows) == 2
     assert written_rows[0]["mr_result"] == "Result 1"
     assert written_rows[1]["mr_result"] == "Result 2"
 
-    assert not err_path.exists()
+    assert len(mock_model.prompt_history) == 1
 
 
 def test_map_worker_model(tmp_path, mock_model):
@@ -942,15 +939,16 @@ def test_reduce_writes_err_file_on_failure(tmp_path):
         assert len(errors) == 1
         assert errors[0]["group_key"] == "B"
         assert "Simulated API failure" in errors[0]["error"]
+
+        assert "rerun to retry" in result.output
     finally:
         pm.unregister(plugin=plugin)
 
 
-def test_reduce_repair_retries_failed_groups(tmp_path, mock_model):
-    """--repair reads the .err file, retries failed groups, merges into output."""
+def test_reduce_resume_skips_done_groups(tmp_path, mock_model):
+    """Re-running with existing output skips already-done groups."""
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
-    err_path = tmp_path / "output.csv.err"
     rows = [
         {"team": "A", "score": "10"},
         {"team": "A", "score": "12"},
@@ -964,8 +962,6 @@ def test_reduce_repair_retries_failed_groups(tmp_path, mock_model):
             {"group": "A", "mr_result": "Summary A"},
         ],
     )
-    with err_path.open("w") as fp:
-        fp.write(json.dumps({"group_key": "B", "error": "previous failure"}) + "\n")
 
     mock_model.queue_response(json.dumps({"mr_result": "Summary B"}))
 
@@ -985,25 +981,27 @@ def test_reduce_repair_retries_failed_groups(tmp_path, mock_model):
             str(output_path),
             "--model",
             "demo",
-            "--repair",
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Repairing 1 groups" in result.output
 
     written_rows = _read_csv(output_path)
     by_group = {r["group"]: r["mr_result"] for r in written_rows}
     assert by_group["A"] == "Summary A"
     assert by_group["B"] == "Summary B"
 
-    assert not err_path.exists()
+    assert len(mock_model.prompt_history) == 1
 
 
-def test_reduce_repair_no_errors(tmp_path, mock_model):
-    """--repair with no .err file is a no-op."""
+def test_reduce_resume_all_done(tmp_path, mock_model):
+    """Re-running when all groups are done is a no-op."""
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
     _write_csv(input_path, [{"team": "A", "score": "10"}])
+    _write_csv(
+        output_path,
+        [{"group": "A", "mr_result": "Summary A"}],
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1021,11 +1019,10 @@ def test_reduce_repair_no_errors(tmp_path, mock_model):
             str(output_path),
             "--model",
             "demo",
-            "--repair",
         ],
     )
     assert result.exit_code == 0
-    assert "No errors to repair" in result.output
+    assert "No groups required LLM processing" in result.output
     assert len(mock_model.prompt_history) == 0
 
 
@@ -1628,20 +1625,57 @@ def test_interactive_mode_blocked_with_stdin():
     assert "Cannot use interactive mode when reading from stdin" in result.output
 
 
-def test_repair_requires_output_to_merge(tmp_path):
-    """--repair with --err but no -o still needs -o to merge results."""
-    stdin_data = '{"id": "1"}\n'
-    err_path = tmp_path / "errors.jsonl"
-    with err_path.open("w") as fp:
-        fp.write(json.dumps({"row_indices": [0], "error": "fail"}) + "\n")
+def test_map_force_overwrites_existing(tmp_path, mock_model):
+    """--force overwrites existing output that doesn't match input."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+
+    _write_csv(input_path, [{"id": "1", "note": "alpha"}])
+    _write_csv(output_path, [{"unrelated": "data"}])
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
     runner = CliRunner()
+    # Without --force, should error
     result = runner.invoke(
         cli,
-        ["mr", "map", "some instruction", "-p", "--repair", "--err", str(err_path)],
-        input=stdin_data,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
     )
     assert result.exit_code != 0
-    assert "--repair requires --output to merge results" in result.output
+    assert "does not match the input shape" in result.output
+
+    # With --force, should succeed
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--force",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written_rows = _read_csv(output_path)
+    assert written_rows[0]["mr_result"] == "Result 1"
 
 
 def test_map_err_flag_overrides_default_sidecar(tmp_path):
@@ -1745,29 +1779,20 @@ def test_map_err_flag_enables_file_logging_with_stdout(tmp_path):
         pm.unregister(plugin=plugin)
 
 
-def test_map_repair_with_err_flag(tmp_path, mock_model):
-    """--repair works with explicit --err path."""
+def test_map_resume_with_limit_expansion(tmp_path, mock_model):
+    """Running with -n 5 then without -n processes remaining rows."""
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
-    custom_err = tmp_path / "custom_errors.jsonl"
 
     rows = [
         {"id": "1", "note": "alpha"},
         {"id": "2", "note": "beta"},
+        {"id": "3", "note": "gamma"},
     ]
     _write_csv(input_path, rows)
-    _write_csv(
-        output_path,
-        [
-            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
-            {"id": "2", "note": "beta", "mr_result": ""},
-        ],
-    )
-    with custom_err.open("w") as fp:
-        fp.write(json.dumps({"row_indices": [1], "error": "previous failure"}) + "\n")
 
-    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
-
+    # First run: -n 1 processes only first row
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
     runner = CliRunner()
     result = runner.invoke(
         cli,
@@ -1782,30 +1807,38 @@ def test_map_repair_with_err_flag(tmp_path, mock_model):
             str(output_path),
             "--model",
             "demo",
-            "--repair",
-            "--err",
-            str(custom_err),
+            "--limit",
+            "1",
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Repairing 1 rows" in result.output
+    assert "Wrote 1 rows" in result.output
 
-    written_rows = _read_csv(output_path)
-    assert written_rows[1]["mr_result"] == "Result 2"
-    assert not custom_err.exists()
-
-
-def test_repair_requires_output_or_err():
-    """--repair without -o or --err is an error."""
-    stdin_data = '{"id": "1"}\n'
-    runner = CliRunner()
+    # Second run: processes remaining rows
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 3"}}))
     result = runner.invoke(
         cli,
-        ["mr", "map", "some instruction", "-p", "--repair"],
-        input=stdin_data,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
     )
-    assert result.exit_code != 0
-    assert "--repair requires --output or --err" in result.output
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 3
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == "Result 2"
+    assert written_rows[2]["mr_result"] == "Result 3"
 
 
 def test_err_records_to_stderr_when_stdout_output(tmp_path):
@@ -1869,14 +1902,17 @@ def test_streamable_protocol_checks():
         XLSXInputPlugin,
         XLSXOutputPlugin,
     )
-    from llm_mr.registries import StreamableInput, StreamableOutput
+    from llm_mr.registries import AppendableOutput, StreamableInput, StreamableOutput
 
     assert isinstance(CSVInputPlugin(), StreamableInput)
     assert isinstance(CSVOutputPlugin(), StreamableOutput)
+    assert isinstance(CSVOutputPlugin(), AppendableOutput)
     assert isinstance(JSONLInputPlugin(), StreamableInput)
     assert isinstance(JSONLOutputPlugin(), StreamableOutput)
+    assert isinstance(JSONLOutputPlugin(), AppendableOutput)
     assert not isinstance(XLSXInputPlugin(), StreamableInput)
     assert not isinstance(XLSXOutputPlugin(), StreamableOutput)
+    assert not isinstance(XLSXOutputPlugin(), AppendableOutput)
 
 
 def test_non_streamable_input_temp_file_fallback(monkeypatch):
@@ -1989,6 +2025,710 @@ def test_hook_registration():
         assert plugin.extensions == [".hooktest"]
     finally:
         mr_pm.unregister(impl)
+
+
+# ---------------------------------------------------------------------------
+# Resume and WAL tests
+# ---------------------------------------------------------------------------
+
+
+def test_map_resume_jsonl(tmp_path, mock_model):
+    """Map resume works with JSONL format."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "note": "alpha"},
+            {"id": "2", "note": "beta"},
+            {"id": "3", "note": "gamma"},
+        ],
+    )
+    _write_jsonl(
+        output_path,
+        [
+            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 3"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 3
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == "Result 2"
+    assert written_rows[2]["mr_result"] == "Result 3"
+
+    # Only 2 LLM calls (rows 2 and 3), not 3
+    assert len(mock_model.prompt_history) == 2
+
+
+def test_map_resume_incremental_append(tmp_path, mock_model):
+    """When existing output has only done rows, new rows are appended."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "note": "alpha"},
+            {"id": "2", "note": "beta"},
+        ],
+    )
+    _write_jsonl(
+        output_path,
+        [
+            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == "Result 2"
+
+    # WAL should be cleaned up
+    wal_path = Path(str(output_path) + ".wal")
+    assert not wal_path.exists()
+
+
+def test_map_incremental_new_file(tmp_path, mock_model):
+    """Fresh run to a new JSONL file uses incremental append (ADR Case 1)."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "note": "alpha"},
+            {"id": "2", "note": "beta"},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 2"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 2
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == "Result 2"
+
+    # WAL should be cleaned up
+    wal_path = Path(str(output_path) + ".wal")
+    assert not wal_path.exists()
+
+
+def test_map_resume_all_done(tmp_path, mock_model):
+    """When all rows are already done, no LLM calls are made."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "note": "alpha"},
+            {"id": "2", "note": "beta"},
+        ],
+    )
+    _write_jsonl(
+        output_path,
+        [
+            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
+            {"id": "2", "note": "beta", "mr_result": "Result 2"},
+        ],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "No rows required LLM processing" in result.output
+    assert len(mock_model.prompt_history) == 0
+
+
+def test_map_wal_survives_failure(tmp_path):
+    """WAL records survive batch failures and enable resume."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "note": "alpha"},
+            {"id": "2", "note": "beta"},
+            {"id": "3", "note": "gamma"},
+        ],
+    )
+
+    model = FailingMockModel(fail_on_calls={1})
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+    model.queue_response(json.dumps({"row_0": {"mr_result": "Result 3"}}))
+
+    class TestPlugin:
+        __name__ = "TestWalFailPlugin"
+
+        @llm.hookimpl
+        def register_models(self, register):
+            register(model)
+
+    plugin = TestPlugin()
+    pm.register(plugin, name="llm-mr-test-wal-fail")
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "mr",
+                "map",
+                "Process note",
+                "-p",
+                "-i",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--model",
+                "failing-demo",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "1 batches failed" in result.output
+
+        written_rows = _read_jsonl(output_path)
+        assert len(written_rows) == 3
+        assert written_rows[0]["mr_result"] == "Result 1"
+        assert written_rows[1].get("mr_result", "") == ""
+        assert written_rows[2]["mr_result"] == "Result 3"
+    finally:
+        pm.unregister(plugin=plugin)
+
+
+def test_wal_tolerates_corrupt_lines(tmp_path):
+    """_read_wal and _read_errors skip truncated/corrupt JSON lines."""
+    from llm_mr.processors import _read_errors, _read_wal
+
+    wal_path = tmp_path / "test.wal"
+    wal_path.write_text(
+        '{"i": 0, "c": "mr_result", "v": "ok"}\n'
+        '{"i": 1, "c": "mr_re\n'  # truncated mid-write
+        '{"i": 2, "c": "mr_result", "v": "also ok"}\n'
+    )
+    records = _read_wal(wal_path)
+    assert len(records) == 2
+    assert records[0]["i"] == 0
+    assert records[1]["i"] == 2
+
+    err_path = tmp_path / "test.err"
+    err_path.write_text(
+        '{"row_indices": [0], "error": "boom"}\n'
+        "not json at all\n"
+        '{"row_indices": [1], "error": "bang"}\n'
+    )
+    errors = _read_errors(err_path)
+    assert len(errors) == 2
+    assert errors[0]["error"] == "boom"
+    assert errors[1]["error"] == "bang"
+
+
+def test_map_force_flag(tmp_path, mock_model):
+    """--force overwrites an existing output file that doesn't match."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(input_path, [{"id": "1", "note": "alpha"}])
+    _write_jsonl(output_path, [{"completely": "different", "data": "here"}])
+
+    # Without --force: error
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "does not match the input shape" in result.output
+
+    # With --force: success
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--force",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written_rows = _read_jsonl(output_path)
+    assert written_rows[0]["mr_result"] == "Result 1"
+
+
+def test_reduce_resume_with_partial_output(tmp_path, mock_model):
+    """Reduce resume skips already-done groups."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(
+        input_path,
+        [
+            {"team": "A", "score": "10"},
+            {"team": "A", "score": "12"},
+            {"team": "B", "score": "5"},
+            {"team": "C", "score": "8"},
+        ],
+    )
+    _write_jsonl(
+        output_path,
+        [
+            {"group": "A", "mr_result": "Summary A"},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"mr_result": "Summary B"}))
+    mock_model.queue_response(json.dumps({"mr_result": "Summary C"}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize group",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    by_group = {r["group"]: r["mr_result"] for r in written_rows}
+    assert by_group["A"] == "Summary A"
+    assert by_group["B"] == "Summary B"
+    assert by_group["C"] == "Summary C"
+
+    assert len(mock_model.prompt_history) == 2
+
+
+def test_map_resume_with_where(tmp_path, mock_model):
+    """Resume works correctly with --where filter."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+
+    rows = [
+        {"id": "1", "status": "active", "note": "alpha"},
+        {"id": "2", "status": "inactive", "note": "beta"},
+        {"id": "3", "status": "active", "note": "gamma"},
+    ]
+    _write_csv(input_path, rows)
+    _write_csv(
+        output_path,
+        [
+            {"id": "1", "status": "active", "note": "alpha", "mr_result": "Result 1"},
+            {"id": "2", "status": "inactive", "note": "beta", "mr_result": ""},
+            {"id": "3", "status": "active", "note": "gamma", "mr_result": ""},
+        ],
+    )
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 3"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--where",
+            "status=active",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert len(written_rows) == 3
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == ""
+    assert written_rows[2]["mr_result"] == "Result 3"
+
+    assert len(mock_model.prompt_history) == 1
+
+
+def test_map_no_resume_on_stdout(tmp_path, mock_model):
+    """Stdout output never resumes — always processes all rows."""
+    rows = [
+        {"id": "1", "note": "alpha"},
+        {"id": "2", "note": "beta"},
+    ]
+    stdin_data = "\n".join(json.dumps(r) for r in rows) + "\n"
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "R1"}}))
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "R2"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["mr", "map", "Process note", "-p", "--model", "demo"],
+        input=stdin_data,
+    )
+    assert result.exit_code == 0, result.stderr
+    assert len(mock_model.prompt_history) == 2
+
+
+def test_map_resume_cleans_up_wal(tmp_path, mock_model):
+    """WAL is deleted after successful completion."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    wal_path = Path(str(output_path) + ".wal")
+
+    _write_jsonl(input_path, [{"id": "1", "note": "alpha"}])
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not wal_path.exists()
+
+
+def test_reduce_force_flag(tmp_path, mock_model):
+    """--force on reduce overwrites existing output."""
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+
+    _write_csv(input_path, [{"team": "A", "score": "10"}])
+    _write_csv(output_path, [{"group": "A", "mr_result": "Old summary"}])
+
+    mock_model.queue_response(json.dumps({"mr_result": "New summary"}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "reduce",
+            "Summarize group",
+            "-p",
+            "-i",
+            str(input_path),
+            "--group-by",
+            "team",
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+            "--force",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(output_path)
+    assert written_rows[0]["mr_result"] == "New summary"
+
+
+def test_map_resume_wal_recovery(tmp_path, mock_model):
+    """WAL entries from a previous interrupted run are picked up on resume."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    wal_path = Path(str(output_path) + ".wal")
+
+    _write_jsonl(
+        input_path,
+        [
+            {"id": "1", "note": "alpha"},
+            {"id": "2", "note": "beta"},
+            {"id": "3", "note": "gamma"},
+        ],
+    )
+    # Output has first row done
+    _write_jsonl(
+        output_path,
+        [
+            {"id": "1", "note": "alpha", "mr_result": "Result 1"},
+        ],
+    )
+    # WAL has second row done (from interrupted run)
+    with wal_path.open("w", encoding="utf-8") as fp:
+        fp.write(json.dumps({"i": 1, "c": "mr_result", "v": "Result 2"}) + "\n")
+
+    # Only row 3 should need processing
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 3"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 3
+    assert written_rows[0]["mr_result"] == "Result 1"
+    assert written_rows[1]["mr_result"] == "Result 2"
+    assert written_rows[2]["mr_result"] == "Result 3"
+
+    assert len(mock_model.prompt_history) == 1
+    assert not wal_path.exists()
+
+
+def test_map_resume_in_place_skips_done(tmp_path, mock_model):
+    """--in-place with existing target column values skips done rows."""
+    input_path = tmp_path / "input.csv"
+    rows = [
+        {"id": "1", "name": "alice", "mr_result": "existing"},
+        {"id": "2", "name": "bob", "mr_result": ""},
+    ]
+    _write_csv(input_path, rows)
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "new"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process name",
+            "-p",
+            "-i",
+            str(input_path),
+            "--in-place",
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    written_rows = _read_csv(input_path)
+    assert written_rows[0]["mr_result"] == "existing"
+    assert written_rows[1]["mr_result"] == "new"
+    assert len(mock_model.prompt_history) == 1
+
+
+def test_superset_matching():
+    """Unit test for _is_superset helper."""
+    from llm_mr.processors import _is_superset
+
+    assert _is_superset(
+        {"id": "1", "name": "alice", "mr_result": "done"},
+        {"id": "1", "name": "alice"},
+    )
+    assert not _is_superset(
+        {"id": "1", "name": "alice"},
+        {"id": "1", "name": "alice", "extra": "field"},
+    )
+    assert not _is_superset(
+        {"id": "1", "name": "bob", "mr_result": "done"},
+        {"id": "1", "name": "alice"},
+    )
+    # str/int cross-type: matches (CSV round-trip tolerance)
+    assert _is_superset({"count": "1"}, {"count": 1})
+    assert _is_superset({"count": 1}, {"count": "1"})
+    # Same-type mismatch: does not match
+    assert not _is_superset({"count": 1}, {"count": 2})
+    assert not _is_superset({"count": "1"}, {"count": "2"})
+    # int/int same-type equality
+    assert _is_superset({"count": 1, "extra": "x"}, {"count": 1})
+    # None vs "None": both strings → no false match; different types → no coercion
+    assert not _is_superset({"v": None}, {"v": "None"})
+
+
+def test_map_resume_state():
+    """Unit test for _match_map_output."""
+    from llm_mr.processors import _match_map_output
+
+    input_rows = [
+        {"id": "1", "name": "alice"},
+        {"id": "2", "name": "bob"},
+        {"id": "3", "name": "carol"},
+    ]
+    output_rows = [
+        {"id": "1", "name": "alice", "result": "A"},
+    ]
+    state = _match_map_output(input_rows, output_rows, "result")
+    assert state.done_indices == {0}
+    assert state.gap_indices == []
+    assert state.tail_start == 1
+
+
+def test_reorder_buffer():
+    """Unit test for ReorderBuffer."""
+    from llm_mr.processors import ReorderBuffer
+
+    buf = ReorderBuffer()
+
+    # Add batch 2 first (out of order)
+    ready = buf.add_batch(2, [(20, {"id": "20"})])
+    assert ready == []
+
+    # Add batch 0
+    ready = buf.add_batch(0, [(0, {"id": "0"})])
+    assert len(ready) == 1
+    assert ready[0][0] == 0
+
+    # Add batch 1 — should flush both batch 1 and buffered batch 2
+    ready = buf.add_batch(1, [(10, {"id": "10"})])
+    assert len(ready) == 2
+    assert ready[0][0] == 10
+    assert ready[1][0] == 20
+
+
+def test_map_resume_empty_output_file(tmp_path, mock_model):
+    """Empty output file is treated as fresh start (no resume)."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    _write_jsonl(input_path, [{"id": "1", "note": "alpha"}])
+    output_path.touch()
+
+    mock_model.queue_response(json.dumps({"row_0": {"mr_result": "Result 1"}}))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "mr",
+            "map",
+            "Process note",
+            "-p",
+            "-i",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--model",
+            "demo",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written_rows = _read_jsonl(output_path)
+    assert len(written_rows) == 1
+    assert written_rows[0]["mr_result"] == "Result 1"
 
 
 # ---------------------------------------------------------------------------
