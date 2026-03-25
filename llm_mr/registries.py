@@ -29,6 +29,14 @@ class TableStream:
 class InputPlugin(Protocol):
     name: str
     extensions: Sequence[str]
+    typed: bool
+    """Whether this format preserves Python types on round-trip.
+
+    ``True`` for formats like JSONL where int 1 stays int 1 after
+    write → read.  ``False`` for formats like CSV where every value
+    becomes a string.  Used by resume matching to decide whether
+    strict equality or string-coerced comparison is appropriate.
+    """
 
     def open(self, path: Path) -> ContextManager[TableStream]: ...
 

@@ -457,6 +457,7 @@ class MapProcessor:
             resume_state: Optional[MapResumeState] = None
             existing_output: List[Dict[str, Any]] = []
             wal_records: List[Dict[str, Any]] = []
+            output_typed = True
 
             if (
                 output_path
@@ -467,6 +468,7 @@ class MapProcessor:
                 if not force:
                     try:
                         output_input_plugin = context.inputs.for_path(output_path)
+                        output_typed = output_input_plugin.typed
                         with output_input_plugin.open(output_path) as out_stream:
                             existing_output, _ = _materialize(out_stream)
                     except Exception:
@@ -474,7 +476,11 @@ class MapProcessor:
 
                     if existing_output:
                         resume_state = _match_map_output(
-                            rows, existing_output, target_column, multiple
+                            rows,
+                            existing_output,
+                            target_column,
+                            multiple,
+                            typed=output_typed,
                         )
                         if not resume_state.done_indices and existing_output:
                             raise click.ClickException(
@@ -497,7 +503,9 @@ class MapProcessor:
                 for in_idx, in_row in enumerate(rows):
                     if (
                         out_cursor < len(existing_output)
-                        and _is_superset(existing_output[out_cursor], in_row)
+                        and _is_superset(
+                            existing_output[out_cursor], in_row, typed=output_typed
+                        )
                         and _has_value(existing_output[out_cursor].get(target_column))
                     ):
                         output_val_by_idx[in_idx] = existing_output[out_cursor][
@@ -1088,8 +1096,10 @@ class FilterProcessor:
             resume_state: Optional[FilterResumeState] = None
 
             if output and output.exists() and output.stat().st_size > 0 and not force:
+                output_typed = True
                 try:
                     output_input_plugin = context.inputs.for_path(output)
+                    output_typed = output_input_plugin.typed
                     with output_input_plugin.open(output) as out_stream:
                         existing_output, _ = _materialize(out_stream)
                 except Exception:
@@ -1100,7 +1110,7 @@ class FilterProcessor:
                     wal_records = _read_wal(wal_path) if wal_path else []
 
                     resume_state = _match_filter_output(
-                        rows, existing_output, err_records
+                        rows, existing_output, err_records, typed=output_typed
                     )
 
                     # Incorporate WAL records
@@ -1782,15 +1792,19 @@ def _delete_wal(wal_path: Optional[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _is_superset(output_row: Dict[str, Any], input_row: Dict[str, Any]) -> bool:
+def _is_superset(
+    output_row: Dict[str, Any],
+    input_row: Dict[str, Any],
+    typed: bool = True,
+) -> bool:
     """True if output_row contains all key-value pairs from input_row.
 
-    Compares by native equality first so that typed formats (JSONL) don't
-    conflate e.g. 1 (int) with "1" (str).  Falls back to str() coercion
-    only when exactly one side is a string and the other isn't — this
-    handles the case where a typed input (e.g. JSONL with int 1) is
-    compared against an output that was read back from CSV (where all
-    values become strings, so int 1 becomes "1").
+    When *typed* is True (the output was read from a type-preserving
+    format like JSONL), values are compared with strict equality only.
+
+    When *typed* is False (the output was read from a string-only format
+    like CSV), values that differ in type but match after str() coercion
+    are considered equal — e.g. int 1 matches string "1".
     """
     for key, value in input_row.items():
         if key not in output_row:
@@ -1798,11 +1812,12 @@ def _is_superset(output_row: Dict[str, Any], input_row: Dict[str, Any]) -> bool:
         out_val = output_row[key]
         if out_val == value:
             continue
+        if typed:
+            return False
         if out_val is None or value is None:
             return False
-        if isinstance(out_val, str) != isinstance(value, str):
-            if str(out_val) == str(value):
-                continue
+        if str(out_val) == str(value):
+            continue
         return False
     return True
 
@@ -1824,6 +1839,7 @@ def _match_map_output(
     output_rows: List[Dict[str, Any]],
     target_column: str,
     multiple: bool = False,
+    typed: bool = True,
 ) -> MapResumeState:
     """Walk input and output in tandem using superset matching for map resume.
 
@@ -1837,7 +1853,9 @@ def _match_map_output(
             break
 
         out_row = output_rows[out_idx]
-        if _is_superset(out_row, in_row) and _has_value(out_row.get(target_column)):
+        if _is_superset(out_row, in_row, typed=typed) and _has_value(
+            out_row.get(target_column)
+        ):
             state.done_indices.add(in_idx)
             state.done_rows.append(out_row)
             state.last_match_index = in_idx
@@ -1845,7 +1863,7 @@ def _match_map_output(
 
             if multiple:
                 while out_idx < len(output_rows) and _is_superset(
-                    output_rows[out_idx], in_row
+                    output_rows[out_idx], in_row, typed=typed
                 ):
                     state.done_rows.append(output_rows[out_idx])
                     out_idx += 1
@@ -1895,6 +1913,7 @@ def _match_filter_output(
     input_rows: List[Dict[str, Any]],
     output_rows: List[Dict[str, Any]],
     err_records: List[Dict[str, Any]],
+    typed: bool = True,
 ) -> FilterResumeState:
     """Walk input and output for filter resume.
 
@@ -1913,7 +1932,7 @@ def _match_filter_output(
     for in_idx, in_row in enumerate(input_rows):
         if out_idx < len(output_rows):
             out_row = output_rows[out_idx]
-            if out_row == in_row or _is_superset(out_row, in_row):
+            if out_row == in_row or _is_superset(out_row, in_row, typed=typed):
                 state.done_indices.add(in_idx)
                 state.kept_indices.add(in_idx)
                 state.last_match_input_index = in_idx
@@ -1986,6 +2005,7 @@ def _merge_map_output(
     target_column: str,
     fieldnames: List[str],
     multiple: bool = False,
+    typed: bool = True,
 ) -> List[Dict[str, Any]]:
     """Merge input rows with existing output and WAL records for map.
 
@@ -1999,7 +2019,7 @@ def _merge_map_output(
         wal_by_index[record["i"]] = record["v"]
 
     resume_state = _match_map_output(
-        input_rows, existing_output, target_column, multiple
+        input_rows, existing_output, target_column, multiple, typed=typed
     )
 
     merged: List[Dict[str, Any]] = []
@@ -2011,7 +2031,7 @@ def _merge_map_output(
             out_idx += 1
             if multiple:
                 while out_idx < len(existing_output) and _is_superset(
-                    existing_output[out_idx], in_row
+                    existing_output[out_idx], in_row, typed=typed
                 ):
                     merged.append(existing_output[out_idx])
                     out_idx += 1

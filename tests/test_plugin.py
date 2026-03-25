@@ -1914,6 +1914,10 @@ def test_streamable_protocol_checks():
     assert not isinstance(XLSXOutputPlugin(), StreamableOutput)
     assert not isinstance(XLSXOutputPlugin(), AppendableOutput)
 
+    assert CSVInputPlugin().typed is False
+    assert JSONLInputPlugin().typed is True
+    assert XLSXInputPlugin().typed is True
+
 
 def test_non_streamable_input_temp_file_fallback(monkeypatch):
     """Piping to a Path-only input plugin spools through a temp file."""
@@ -2635,6 +2639,7 @@ def test_superset_matching():
     """Unit test for _is_superset helper."""
     from llm_mr.processors import _is_superset
 
+    # Basic superset checks (typed=True is default)
     assert _is_superset(
         {"id": "1", "name": "alice", "mr_result": "done"},
         {"id": "1", "name": "alice"},
@@ -2647,16 +2652,20 @@ def test_superset_matching():
         {"id": "1", "name": "bob", "mr_result": "done"},
         {"id": "1", "name": "alice"},
     )
-    # str/int cross-type: matches (CSV round-trip tolerance)
-    assert _is_superset({"count": "1"}, {"count": 1})
-    assert _is_superset({"count": 1}, {"count": "1"})
-    # Same-type mismatch: does not match
-    assert not _is_superset({"count": 1}, {"count": 2})
-    assert not _is_superset({"count": "1"}, {"count": "2"})
-    # int/int same-type equality
-    assert _is_superset({"count": 1, "extra": "x"}, {"count": 1})
-    # None vs "None": both strings → no false match; different types → no coercion
-    assert not _is_superset({"v": None}, {"v": "None"})
+
+    # typed=True (JSONL-like): strict equality, no cross-type coercion
+    assert not _is_superset({"count": "1"}, {"count": 1}, typed=True)
+    assert not _is_superset({"count": 1}, {"count": "1"}, typed=True)
+    assert _is_superset({"count": 1, "extra": "x"}, {"count": 1}, typed=True)
+    assert not _is_superset({"v": None}, {"v": "None"}, typed=True)
+
+    # typed=False (CSV-like): str coercion for cross-type matches
+    assert _is_superset({"count": "1"}, {"count": 1}, typed=False)
+    assert _is_superset({"count": 1}, {"count": "1"}, typed=False)
+    assert not _is_superset({"count": 1}, {"count": 2}, typed=False)
+    assert not _is_superset({"count": "1"}, {"count": "2"}, typed=False)
+    # None never coerces even in untyped mode
+    assert not _is_superset({"v": None}, {"v": "None"}, typed=False)
 
 
 def test_map_resume_state():

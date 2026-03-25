@@ -17,6 +17,7 @@
 
 - Removed `--repair` flag (replaced by automatic resume).
 - File output writes are now atomic (temp file + rename) for non-incremental paths.
+- `InputPlugin` protocol now requires a `typed: bool` property indicating whether the format preserves Python types on round-trip. Resume matching uses strict equality for typed formats (JSONL, XLSX) and allows string coercion for untyped formats (CSV).
 - WAL and `.err` readers tolerate truncated/corrupt lines from mid-write kills.
 
 ## [0.1.0] — 2026-03-19

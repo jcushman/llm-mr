@@ -14,6 +14,7 @@ from .registries import InputRegistry, OutputRegistry, Row, RowAppender, TableSt
 class CSVInputPlugin:
     name = "csv"
     extensions = [".csv"]
+    typed = False
 
     @contextmanager
     def open(self, path: Path) -> Iterator[TableStream]:
@@ -85,6 +86,7 @@ class CSVOutputPlugin:
 class JSONLInputPlugin:
     name = "jsonl"
     extensions = [".jsonl"]
+    typed = True
 
     @contextmanager
     def open(self, path: Path) -> Iterator[TableStream]:
@@ -163,6 +165,7 @@ class JSONLOutputPlugin:
 class XLSXInputPlugin:
     name = "xlsx"
     extensions = [".xlsx"]
+    typed = True
 
     @contextmanager
     def open(self, path: Path) -> Iterator[TableStream]:
